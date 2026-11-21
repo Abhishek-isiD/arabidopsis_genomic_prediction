@@ -1,0 +1,275 @@
+---
+title: "PCA Study on Screened SNPs — Variance Explained and the Final RIS-PCR Model"
+author: "Abck"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 8, fig.height = 5)
+knitr::opts_knit$set(root.dir = "~/arabidopsis_project")
+```
+
+## 1. What this does
+
+RIS-PCR was the best-performing method so far (MSPE 107.93 vs RIS-RP's 170.43, same
+8,718 screened SNPs, same everything else -- only the projection differs: real
+principal components instead of a random matrix). This document:
+
+1. Reproduces that exact screened, standardized training matrix
+2. Runs a full PCA study on it -- variance explained per PC, cumulative variance,
+   and a PC1-vs-PC2 view colored by flowering time
+3. Refits the actual winning model and writes it out explicitly as
+   $y = a_0 + a_1 \text{PC}_1 + a_2 \text{PC}_2 + \dots + a_{100}\text{PC}_{100}$,
+   with the real fitted coefficients
+
+```{r blas-fix}
+if (!requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+  stop("Run in terminal first: micromamba install -c conda-forge r-rhpcblasctl")
+}
+RhpcBLASctl::blas_set_num_threads(1)
+N_CORES <- 3
+
+mem_check <- function(label) {
+  g <- gc(full = TRUE)
+  cat(sprintf("[memory] %s: %.0f MB in use\n", label, sum(g[, 2])))
+}
+```
+
+## 2. Reproduce the screened, standardized data (same seeds as before)
+
+```{r reproduce-screening}
+library(bigsnpr); library(bigstatsr)
+
+obj.bigSNP <- snp_attach("arabidopsis_1135_matched.rds")
+G <- obj.bigSNP$genotypes; fam <- obj.bigSNP$fam
+pheno <- read.csv("flowering_time.csv")
+y_all <- pheno$FT10[match(as.character(fam$sample.ID), as.character(pheno$accession_id))]
+n <- nrow(G); p <- ncol(G)
+
+G2 <- snp_fastImputeSimple(G, method = "mean2", ncores = N_CORES)
+
+set.seed(42)
+train_idx <- sample(seq_len(n), size = round(0.8 * n))
+test_idx  <- setdiff(seq_len(n), train_idx)
+y_train <- y_all[train_idx]; y_test <- y_all[test_idx]
+y_mean  <- mean(y_train);    y_train_c <- y_train - y_mean
+
+gwas <- big_univLinReg(G2, y.train = y_all, ncores = N_CORES)
+t_stat <- gwas$estim / gwas$std.err
+r <- sign(t_stat) * sqrt(t_stat^2 / (t_stat^2 + (n - 2))); r[is.na(r)] <- 0
+delta <- max(0, (1 + log(p / n)) / 2)
+q <- abs(r)^delta; q <- q / max(q)
+set.seed(1)
+included_rp <- which(rbinom(p, 1, q) == 1)
+cat("Screened SNPs:", length(included_rp), "(should match earlier run: 8718)\n")
+
+X_s <- G2[, included_rp]
+col_mean <- colMeans(X_s[train_idx, ]); col_sd <- apply(X_s[train_idx, ], 2, sd); col_sd[col_sd == 0] <- 1
+X_train_s <- scale(X_s[train_idx, ], center = col_mean, scale = col_sd)
+X_test_s  <- scale(X_s[test_idx, ],  center = col_mean, scale = col_sd)
+rm(X_s, G); mem_check("after reproducing screened matrix")
+```
+
+## 3. Full PCA on the screened, standardized training matrix
+
+Capped at the top 300 components rather than the full 801 possible -- in genomic data
+this dense with linkage disequilibrium, variance beyond a few hundred components is
+essentially noise, and 300 is already 3x the 100 the model actually uses, enough to
+see the full decay shape without an unnecessarily heavy computation.
+
+```{r full-pca}
+pca_full <- prcomp(X_train_s, center = FALSE, scale. = FALSE, rank. = 300)
+mem_check("after full PCA")
+
+var_explained <- (pca_full$sdev^2) / sum(pca_full$sdev^2) * 100
+cum_var <- cumsum(var_explained)
+
+cat("Variance explained by first 10 PCs (%):\n")
+print(round(var_explained[1:10], 2))
+
+cat("\nPCs needed to reach:\n")
+cat("  50% variance:", which(cum_var >= 50)[1], "\n")
+cat("  80% variance:", which(cum_var >= 80)[1], "\n")
+cat("  90% variance:", which(cum_var >= 90)[1], "\n")
+cat("  Variance explained by first 100 PCs (used in the model):", round(cum_var[100], 2), "%\n")
+```
+
+## 4. Plot: scree plot (variance explained per PC)
+
+```{r scree-plot}
+plot(1:100, var_explained[1:100], type = "b", pch = 19, cex = 0.5,
+     xlab = "Principal Component", ylab = "Variance Explained (%)",
+     main = "Scree Plot -- First 100 PCs")
+abline(v = 100, col = "red", lty = 2)
+```
+
+## 5. Plot: cumulative variance explained
+
+```{r cumulative-variance}
+# note: prcomp's rank. only truncates $rotation/$x, not $sdev -- cum_var is the
+# FULL spectrum (length ~801 here), so we plot against its actual length rather
+# than assuming it matches the rank. cap used for the loadings
+plot(seq_along(cum_var), cum_var, type = "l", lwd = 2,
+     xlab = "Number of Principal Components", ylab = "Cumulative Variance Explained (%)",
+     main = sprintf("Cumulative Variance Explained -- All %d Components", length(cum_var)))
+abline(h = c(50, 80, 90), col = "gray50", lty = 3)
+abline(v = 100, col = "red", lty = 2)
+legend("bottomright", legend = c("50/80/90% reference", "100 PCs (used in model)"),
+       col = c("gray50", "red"), lty = c(3, 2), bty = "n")
+```
+
+## 6. Plot: PC1 vs PC2, colored by flowering time
+
+If PC1/PC2 mostly track geography (population structure) rather than flowering time,
+you'll see color scattered fairly evenly across the point cloud rather than forming a
+clean gradient along one axis.
+
+```{r pc1-pc2-scatter}
+scores <- pca_full$x[, 1:2]
+col_ramp <- colorRampPalette(c("blue", "yellow", "red"))(100)
+y_bin <- cut(y_train, breaks = 100, labels = FALSE)
+
+plot(scores[, 1], scores[, 2], col = col_ramp[y_bin], pch = 19, cex = 0.8,
+     xlab = "PC1", ylab = "PC2", main = "PC1 vs PC2, colored by FT10 (blue=low, red=high)")
+```
+
+## 7. Refit the winning model (RIS-PCR) using the first 100 PCs
+
+```{r refit-model}
+m_n <- 100
+Z_train <- X_train_s %*% pca_full$rotation[, 1:m_n]
+Z_test  <- X_test_s  %*% pca_full$rotation[, 1:m_n]
+
+a_sigma <- 0.01; b_sigma <- 0.01
+A <- diag(m_n) + t(Z_train) %*% Z_train
+mu_t <- solve(A) %*% t(Z_train) %*% y_train_c
+
+pred_test <- (Z_test %*% mu_t) + y_mean
+mspe <- mean((y_test - pred_test)^2)
+cat("RIS-PCR Test MSPE (sanity check, should match 107.93):", mspe, "\n")
+```
+
+## 8. Plot: fitted coefficient for each of the 100 PCs used
+
+```{r coef-plot}
+coefs <- as.numeric(mu_t)
+barplot(coefs, names.arg = 1:m_n, las = 2, cex.names = 0.5,
+        xlab = "Principal Component", ylab = "Coefficient (a_k)",
+        main = "Fitted Coefficients, y = a0 + sum(a_k * PC_k)", col = "steelblue", border = NA)
+abline(h = 0, col = "gray30")
+```
+
+## 9. The final model, written out explicitly
+
+```{r final-model}
+a0 <- y_mean
+ranked <- order(abs(coefs), decreasing = TRUE)
+
+cat("Final fitted model:\n")
+cat(sprintf("y = %.3f", a0))
+for (k in ranked[1:10]) {
+  sign_str <- if (coefs[k] >= 0) " + " else " - "
+  cat(sprintf("%s%.4f * PC%d", sign_str, abs(coefs[k]), k))
+}
+cat(" + ... (90 more PC terms)\n\n")
+
+cat("Top 10 PCs by contribution (|coefficient|):\n")
+top10 <- data.frame(PC = ranked[1:10], coefficient = round(coefs[ranked[1:10]], 4),
+                     variance_explained_pct = round(var_explained[ranked[1:10]], 2))
+print(top10)
+
+cat("\nFull model uses all 100 PCs; a0 =", round(a0, 3),
+    "(this is just mean(y_train) -- the model predicts deviations from it)\n")
+
+saveRDS(list(a0 = a0, coefs = coefs, rotation = pca_full$rotation[, 1:m_n],
+             col_mean = col_mean, col_sd = col_sd, included_rp = included_rp),
+        "final_pca_model.rds")
+cat("Saved final_pca_model.rds\n")
+```
+
+## 10. Honest notes
+
+- $a_0$ is just $\bar{y}_{train}$ -- the model's baseline is the mean, and every PC
+  term is a *deviation* from it.
+- A PC with a large coefficient but low variance-explained is a PC that captures a
+  small share of total genetic variation but is disproportionately predictive of
+  flowering time -- worth flagging as a candidate for the "which underlying SNPs load
+  heavily on this PC" follow-up question.
+- These are principal components of the **screened SNP matrix**, not raw SNPs --
+  translating a PC back into "which genes/positions matter" requires looking at
+  `pca_full$rotation[, k]`, the loading of each of the 8,718 screened SNPs on PC k.
+
+## 11. Exploiting orthogonality: does adding more PCs improve held-out MSPE?
+
+Because PCs from one decomposition are mutually orthogonal, and the NIG posterior
+here uses an isotropic (diagonal) prior, every PC's coefficient is *exactly* the
+same whether fit alone, in a batch, or jointly with all the others:
+$\mu_{t,j} = Z_j'y_c / (1+Z_j'Z_j)$, independent of what else is in the model. So
+instead of refitting from scratch for each PC count, we compute every PC's
+coefficient once and just extend the slice.
+
+**This does not generalize to RIS-RP or GSIS** -- a random projection matrix's
+output columns are not orthogonal, so this shortcut is specific to PCA.
+
+```{r pc-count-sweep}
+Z_full_train <- X_train_s %*% pca_full$rotation
+d_j   <- colSums(Z_full_train^2)
+mu_all <- colSums(Z_full_train * y_train_c) / (1 + d_j)
+
+Z_full_test <- X_test_s %*% pca_full$rotation
+
+pc_counts <- c(10, 25, 50, 100, 150, 200, 246, 300)
+mspe_by_count <- sapply(pc_counts, function(k) {
+  pred <- (Z_full_test[, 1:k, drop = FALSE] %*% mu_all[1:k]) + y_mean
+  mean((y_test - pred)^2)
+})
+
+results_sweep <- data.frame(n_PCs = pc_counts,
+                             cum_variance_pct = round(cum_var[pc_counts], 1),
+                             Test_MSPE = round(mspe_by_count, 2))
+print(results_sweep)
+
+plot(pc_counts, mspe_by_count, type = "b", pch = 19,
+     xlab = "Number of PCs used", ylab = "Test MSPE",
+     main = "Test MSPE vs Number of PCs (via orthogonality shortcut)")
+abline(h = 107.93, col = "blue", lty = 2)
+legend("topright", legend = "m_n=100 result (107.93)", col = "blue", lty = 2, bty = "n")
+```
+
+**Caveat, restated precisely:** the MSPE numbers above are exact point predictions,
+unaffected by the uncertainty-decomposition issue -- that issue only affects formal
+credible intervals, not this curve.
+
+## 12. Regression lines for the top PCs, one panel, using the model's own coefficients
+
+Each subplot's line is $y = a_0 + a_k \cdot \text{PC}_k$ using the *actual* fitted
+coefficient from the model (section 9/11) -- not a separately re-estimated OLS line.
+Because of the orthogonality property, these are exactly the marginal slices of the
+real additive model, term by term. Ranked by contribution (`|coefficient|`), not by
+variance-explained order -- change `top_n` to 10 for a smaller grid.
+
+```{r top-pc-panel, fig.width=14, fig.height=10}
+top_n <- 20   # set to 10 for a 2x5 grid instead
+top_pcs <- ranked[1:top_n]
+n_row <- ceiling(top_n / 5)
+
+par(mfrow = c(n_row, 5), mar = c(3, 3, 2.5, 1), mgp = c(2, 0.7, 0))
+for (k in top_pcs) {
+  x <- pca_full$x[, k]   # this PC's training scores
+  plot(x, y_train, pch = 19, cex = 0.5, col = "gray40",
+       xlab = paste0("PC", k), ylab = "FT10",
+       main = sprintf("PC%d  a=%.2f  var=%.1f%%", k, coefs[k], var_explained[k]),
+       cex.main = 0.85)
+  abline(a = y_mean, b = coefs[k], col = "red", lwd = 2)
+}
+par(mfrow = c(1, 1))
+```
+
+**Reading this panel:** a PC with a visibly steep red line and a tight scatter
+around it is doing real predictive work. A PC with a high `var=` (explains a lot of
+genetic variation) but a flat line contributes little to flowering time despite
+being a major axis of genetic variation -- likely population structure rather than
+signal. A PC with a low `var=` but a steep line is the more interesting case: a
+minor share of total genetic variation that happens to matter disproportionately for
+the phenotype.

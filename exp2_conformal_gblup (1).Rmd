@@ -1,0 +1,289 @@
+---
+title: "Experiment 2: Calibrated intervals around GBLUP -- Bayesian vs conformal vs Mondrian-by-subpopulation, and TARP-style NIG intervals"
+author: "Abck"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 9, fig.height = 5)
+knitr::opts_knit$set(root.dir = "~/arabidopsis_project")
+```
+
+## 1. Questions
+
+1. **Do the paper-style Bayesian (NIG) intervals cover?** TARP's NIG posterior gives predictive
+   t-intervals. The paper reports empirical coverage (ECP) and says RIS-RP covers better than
+   RIS-PCR. Here screening has used the training `y`, so the model has seen its own signal
+   twice; the intervals may be too narrow on new samples.
+2. **Does split-conformal prediction deliver its 90% guarantee around GBLUP?** GBLUP has no
+   supervised screening step, so a held-out calibration set is clean.
+3. **Does coverage hold *within* subpopulations?** Conformal coverage is marginal. Population
+   structure can make some ancestry groups systematically harder, so a Mondrian version
+   (calibrated separately per subpopulation) is compared with the pooled one.
+4. **Can the GP posterior variance make conformal intervals adaptive?** Scores are divided by the
+   kernel model's predictive sd, so unusual accessions get wider intervals while the conformal
+   guarantee still holds.
+
+Methods (all at nominal 90%):
+
+| Key | Interval |
+|---|---|
+| `A_conformal` | GBLUP + split conformal, absolute residuals (constant width) |
+| `B_bayes_t` | GBLUP as a kernel-NIG model: Student-t predictive interval (no calibration set) |
+| `C_gp_conformal` | GBLUP + conformal on residuals normalized by the GP predictive sd |
+| `D_mondrian` | like A, but calibrated separately within each subpopulation cluster |
+| `E_TARP_PCA_NIG` | TARP-style: RIS screening, 100 PCs, NIG t-interval (the paper's recipe, one projection) |
+| `F_TARP_RP_NIG` | TARP-style: RIS screening, one sparse random projection (m = 100), NIG t-interval |
+
+A-D are fit on 75% of the training rows (the rest is the calibration set); E-F use all training
+rows. Same seeds, splits and screened sets as every earlier run.
+
+```{r blas-fix}
+if (!requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+  stop("Run in terminal first: micromamba install -c conda-forge r-rhpcblasctl")
+}
+RhpcBLASctl::blas_set_num_threads(1)
+N_CORES <- 3
+N_REPS <- 10
+ALPHA <- 0.10
+K_GROUPS <- 3
+MIN_G <- 15          # smallest calibration group that gets its own conformal quantile
+LAM_GRID <- 10^seq(-3, 3, length.out = 61)
+mem_check <- function(label) {
+  g <- gc(full = TRUE)
+  cat(sprintf("[memory] %s: %.0f MB in use\n", label, sum(g[, 2])))
+}
+```
+
+```{r load-once}
+library(bigsnpr); library(bigstatsr)
+obj.bigSNP <- snp_attach("arabidopsis_1135_matched.rds")
+G <- obj.bigSNP$genotypes; fam <- obj.bigSNP$fam
+pheno <- read.csv("flowering_time.csv")
+y_all <- pheno$FT10[match(as.character(fam$sample.ID), as.character(pheno$accession_id))]
+n <- nrow(G); p <- ncol(G)
+G2 <- snp_fastImputeSimple(G, method = "mean2", ncores = N_CORES)
+
+gr <- readRDS("gram_full_snp.rds"); Kfull <- gr$K            # built in Experiment 0
+stopifnot(nrow(Kfull) == n)
+mem_check("after loading")
+```
+
+## 2. Subpopulation clusters (unsupervised, from the genome-wide kernel only)
+
+Top 5 principal axes of the full-SNP kernel, then k-means. `y` is never used, so the labels are
+a fixed property of the accessions.
+
+```{r groups}
+eK <- eigen(Kfull, symmetric = TRUE)
+pcs <- sweep(eK$vectors[, 1:5], 2, sqrt(eK$values[1:5]), "*")
+set.seed(2024)
+grp <- kmeans(pcs, centers = K_GROUPS, nstart = 25)$cluster
+rm(eK)
+cat("Subpopulation cluster sizes (all", n, "accessions):\n"); print(table(grp))
+cat("Mean FT10 by cluster (shows whether ancestry tracks the phenotype):\n")
+print(round(tapply(y_all, grp, mean), 1))
+```
+
+## 3. Helpers
+
+```{r helpers}
+conf_q <- function(scores, alpha) {            # split-conformal quantile with the finite-sample correction
+  m <- length(scores); k <- ceiling((m + 1) * (1 - alpha))
+  if (k > m) Inf else sort(scores)[k]
+}
+
+interval_metrics <- function(lo, hi, y, g, alpha) {
+  hit <- (y >= lo) & (y <= hi)
+  isc <- (hi - lo) + (2 / alpha) * pmax(lo - y, 0) + (2 / alpha) * pmax(y - hi, 0)   # Winkler interval score
+  gcov <- sapply(seq_len(K_GROUPS), function(k) if (any(g == k)) mean(hit[g == k]) else NA_real_)
+  list(cov = mean(hit), wid = mean(hi - lo), iscore = mean(isc), gcov = gcov, mincov = min(gcov, na.rm = TRUE))
+}
+
+# GBLUP as a kernel-NIG model; lambda by closed-form LOOCV (valid: no supervised screening involved)
+gp_fit <- function(K_tt, y_c, lam_grid, a = 0.01, b = 0.01) {
+  n <- length(y_c)
+  eg <- eigen(K_tt, symmetric = TRUE); e <- pmax(eg$values, 0); U <- eg$vectors
+  yt <- as.numeric(crossprod(U, y_c))
+  S <- outer(e, lam_grid, function(ei, li) ei / (ei + li))
+  h <- (U^2) %*% S; yhat <- U %*% (S * yt)
+  loo <- colMeans(((y_c - yhat) / pmax(1 - h, 1e-8))^2)
+  lam <- lam_grid[which.min(loo)]
+  s2 <- (2 * b + sum(yt^2 / (1 + e / lam))) / (n + 2 * a)    # NIG posterior scale
+  list(e = e, U = U, yt = yt, lam = lam, s2 = s2, df = n + 2 * a)
+}
+# predictive mean and kernel variance term v = K** - k*' (K + lambda I)^-1 k*
+gp_predict <- function(fit, K_new, k_diag) {
+  KU <- K_new %*% fit$U
+  mean_c <- as.numeric(KU %*% (fit$yt / (fit$e + fit$lam)))
+  quad <- rowSums(sweep(KU^2, 2, fit$e + fit$lam, "/"))
+  list(mean_c = mean_c, v = pmax(k_diag - quad, 0))
+}
+
+# the paper's predictive: t_{n+2a}(z'mu, s2 * (1 + z'Wz)), W = (I + Z'Z)^-1
+nig_interval <- function(Z_tr, Z_te, yc, ym, alpha, a = 0.01, b = 0.01) {
+  n <- length(yc); m <- ncol(Z_tr)
+  A <- diag(m) + crossprod(Z_tr)
+  mu <- solve(A, crossprod(Z_tr, yc))
+  quad <- as.numeric(crossprod(mu, A %*% mu))
+  s2 <- (sum(yc^2) - quad + 2 * b) / (n + 2 * a)
+  Wz <- solve(A, t(Z_te))
+  vfac <- 1 + colSums(t(Z_te) * Wz)
+  half <- qt(1 - alpha / 2, n + 2 * a) * sqrt(s2 * vfac)
+  mid <- as.numeric(Z_te %*% mu) + ym
+  list(lo = mid - half, hi = mid + half)
+}
+
+tarp_omega <- function(p_gamma, l, psi = 0.25) {
+  u <- runif(p_gamma * l); Om <- matrix(0, p_gamma, l); val <- 1 / sqrt(2 * psi)
+  Om[u < psi] <- val; Om[u >= psi & u < 2 * psi] <- -val; Om
+}
+
+screen_set <- function(tr_rows, y_tr_vec) {                    # TARP step 1 using only the given rows
+  gw <- big_univLinReg(G2, y.train = y_tr_vec, ind.train = tr_rows, ncores = N_CORES)
+  tt <- gw$estim / gw$std.err
+  r <- sign(tt) * sqrt(tt^2 / (tt^2 + (length(tr_rows) - 2))); r[is.na(r)] <- 0
+  delta <- max(0, (1 + log(p / length(tr_rows))) / 2)
+  q_in <- abs(r)^delta; q_in <- q_in / max(q_in)
+  list(inc = which(rbinom(p, 1, q_in) == 1))
+}
+```
+
+## 4. One replication
+
+```{r replication-fn}
+run_rep <- function(seed_i) {
+  set.seed(seed_i)                                              # same RNG path as every earlier run
+  train_idx <- sample(seq_len(n), size = round(0.8 * n))
+  test_idx  <- setdiff(seq_len(n), train_idx)
+  y_te <- y_all[test_idx]; g_te <- grp[test_idx]
+  y_tr <- y_all[train_idx]; ym <- mean(y_tr); yc <- y_tr - ym
+
+  ## E, F: TARP-style NIG intervals. Screening uses the training rows (same screened set as before).
+  sc <- screen_set(train_idx, y_tr)
+  Xs <- G2[, sc$inc]
+  cm <- colMeans(Xs[train_idx, ]); cs <- apply(Xs[train_idx, ], 2, sd); cs[cs == 0] <- 1
+  X_tr <- scale(Xs[train_idx, ], center = cm, scale = cs)
+  X_te <- scale(Xs[test_idx, ],  center = cm, scale = cs)
+  rm(Xs)
+  pca <- prcomp(X_tr, center = FALSE, scale. = FALSE, rank. = 100)
+  iv_E <- nig_interval(X_tr %*% pca$rotation, X_te %*% pca$rotation, yc, ym, ALPHA)
+  set.seed(seed_i * 1000 + 13)
+  Om <- tarp_omega(ncol(X_tr), 100)
+  iv_F <- nig_interval(X_tr %*% Om, X_te %*% Om, yc, ym, ALPHA)
+
+  ## A-D: GBLUP intervals with a clean calibration set
+  set.seed(seed_i * 1000 + 11)
+  cal_pos <- sample(seq_along(train_idx), size = round(0.25 * length(train_idx)))
+  cal_idx <- train_idx[cal_pos]; pt_idx <- train_idx[-cal_pos]
+  y_pt <- y_all[pt_idx]; ym_pt <- mean(y_pt); y_cal <- y_all[cal_idx]
+  fit <- gp_fit(Kfull[pt_idx, pt_idx], y_pt - ym_pt, LAM_GRID)
+  kd <- diag(Kfull)
+  pc <- gp_predict(fit, Kfull[cal_idx, pt_idx, drop = FALSE], kd[cal_idx])
+  pe <- gp_predict(fit, Kfull[test_idx, pt_idx, drop = FALSE], kd[test_idx])
+  mu_cal <- pc$mean_c + ym_pt; mu_te <- pe$mean_c + ym_pt
+  res_cal <- abs(y_cal - mu_cal)
+  sdf_cal <- sqrt(1 + pc$v / fit$lam); sdf_te <- sqrt(1 + pe$v / fit$lam)
+
+  qA <- conf_q(res_cal, ALPHA)
+  half_B <- qt(1 - ALPHA / 2, fit$df) * sqrt(fit$s2) * sdf_te
+  qC <- conf_q(res_cal / sdf_cal, ALPHA)
+  g_cal <- grp[cal_idx]
+  qD <- sapply(seq_len(K_GROUPS), function(g) {
+    s <- res_cal[g_cal == g]; if (length(s) >= MIN_G) conf_q(s, ALPHA) else qA })
+
+  ints <- list(
+    A_conformal    = list(lo = mu_te - qA,           hi = mu_te + qA),
+    B_bayes_t      = list(lo = mu_te - half_B,       hi = mu_te + half_B),
+    C_gp_conformal = list(lo = mu_te - qC * sdf_te,  hi = mu_te + qC * sdf_te),
+    D_mondrian     = list(lo = mu_te - qD[g_te],     hi = mu_te + qD[g_te]),
+    E_TARP_PCA_NIG = iv_E,
+    F_TARP_RP_NIG  = iv_F)
+
+  out <- data.frame(seed = seed_i, n_screened = length(sc$inc),
+                    mspe_GBLUP75 = mean((y_te - mu_te)^2),
+                    mspe_E = mean((y_te - (iv_E$lo + iv_E$hi) / 2)^2),
+                    mspe_F = mean((y_te - (iv_F$lo + iv_F$hi) / 2)^2))
+  for (nm in names(ints)) {
+    mm <- interval_metrics(ints[[nm]]$lo, ints[[nm]]$hi, y_te, g_te, ALPHA)
+    out[[paste0("cov_", nm)]] <- mm$cov;  out[[paste0("wid_", nm)]] <- mm$wid
+    out[[paste0("isc_", nm)]] <- mm$iscore; out[[paste0("mincov_", nm)]] <- mm$mincov
+    for (k in seq_len(K_GROUPS)) out[[paste0("gcov_", nm, "_g", k)]] <- mm$gcov[k]
+  }
+  out
+}
+```
+
+## 5. Run (about a minute per seed; checkpointed)
+
+```{r run}
+ckpt <- "exp2_results.rds"
+res_list <- if (file.exists(ckpt)) readRDS(ckpt) else list()
+cat("Resuming with", length(res_list), "reps done\n")
+for (i in seq_len(N_REPS)) {
+  if (i <= length(res_list) && !is.null(res_list[[i]])) next
+  t0 <- Sys.time()
+  res_list[[i]] <- run_rep(i)
+  saveRDS(res_list, ckpt)
+  r_ <- res_list[[i]]
+  cat(sprintf("Rep %d/%d (%.1f min) | coverage  A %.2f  B %.2f  C %.2f  D %.2f  E %.2f  F %.2f\n",
+              i, N_REPS, as.numeric(difftime(Sys.time(), t0, units = "mins")),
+              r_$cov_A_conformal, r_$cov_B_bayes_t, r_$cov_C_gp_conformal,
+              r_$cov_D_mondrian, r_$cov_E_TARP_PCA_NIG, r_$cov_F_TARP_RP_NIG))
+  mem_check(paste("rep", i))
+}
+all_res <- do.call(rbind, res_list)
+```
+
+## 6. Results at nominal 90%
+
+```{r summary}
+nms <- c("A_conformal", "B_bayes_t", "C_gp_conformal", "D_mondrian", "E_TARP_PCA_NIG", "F_TARP_RP_NIG")
+R <- nrow(all_res)
+tab <- data.frame(
+  Method = nms,
+  Coverage = sapply(nms, function(m) mean(all_res[[paste0("cov_", m)]])),
+  SE = sapply(nms, function(m) sd(all_res[[paste0("cov_", m)]]) / sqrt(R)),
+  Seeds_in_85_95 = sapply(nms, function(m) sum(all_res[[paste0("cov_", m)]] >= 0.85 & all_res[[paste0("cov_", m)]] <= 0.95)),
+  Mean_width = sapply(nms, function(m) mean(all_res[[paste0("wid_", m)]])),
+  Interval_score = sapply(nms, function(m) mean(all_res[[paste0("isc_", m)]])),
+  Worst_group_coverage = sapply(nms, function(m) mean(all_res[[paste0("mincov_", m)]]))
+)
+rownames(tab) <- NULL
+knitr::kable(tab, digits = 3, caption = sprintf("%d seeds, nominal coverage %.0f%%. Interval score: lower is better (width plus penalties for misses).", R, 100 * (1 - ALPHA)))
+
+gtab <- sapply(seq_len(K_GROUPS), function(g) sapply(nms, function(m) mean(all_res[[paste0("gcov_", m, "_g", g)]], na.rm = TRUE)))
+colnames(gtab) <- paste0("cluster", seq_len(K_GROUPS), " (", as.integer(table(grp)), " accessions)")
+knitr::kable(gtab, digits = 3, caption = "Mean test coverage within each subpopulation cluster")
+
+cat("\nPoint accuracy, for reference (test MSPE): GBLUP fit on 75% of training rows",
+    round(mean(all_res$mspe_GBLUP75), 1), "| TARP-style PCA", round(mean(all_res$mspe_E), 1),
+    "| TARP-style RP (single draw)", round(mean(all_res$mspe_F), 1), "\n")
+
+cov_mat <- sapply(nms, function(m) all_res[[paste0("cov_", m)]])
+par(mar = c(9, 4, 3, 1)); boxplot(cov_mat, las = 2, ylab = "test coverage", main = "Coverage across seeds (target 0.90)")
+abline(h = 1 - ALPHA, lty = 2, col = "red")
+mc_mat <- sapply(nms, function(m) all_res[[paste0("mincov_", m)]])
+boxplot(mc_mat, las = 2, ylab = "coverage in the worst subpopulation", main = "Worst-group coverage across seeds")
+abline(h = 1 - ALPHA, lty = 2, col = "red")
+```
+
+## 7. How to read this
+
+- **`E` / `F` well below 0.90:** the paper-style Bayesian intervals under-cover once supervised
+  screening has used the training `y`. That answers question 1 for this dataset and is a direct,
+  checkable test of the paper's coverage claim (compare `F` with `E`, since the paper says RIS-RP
+  covers better than RIS-PCR).
+- **`A` near 0.90 marginally** is the conformal guarantee working. Seeds are random splits of
+  the same 1,003 accessions, so treat the across-seed spread as a rough guide only.
+- **`B` far from 0.90 in either direction** shows the Gaussian-process variance is mis-specified
+  for this trait (it assumes a stationary, homoscedastic model).
+- **`A` fine overall but one cluster far from 0.90 while `D` repairs it:** marginal coverage hid
+  subpopulation-specific miscalibration, and Mondrian calibration fixes it at a cost in width.
+  Small clusters get few calibration points (`MIN_G`), so their quantiles are noisy.
+- **`C` vs `A`:** if `C` has a lower interval score at the same coverage, normalizing by the GP
+  variance made the intervals more efficient without losing the guarantee.
+- **Caveats:** one trait; 201 test points per seed means about 0.02 binomial noise in coverage
+  per seed; the clusters come from a 3-means cut of a continuous ancestry gradient, so they are
+  a convenient grouping and not a biological taxonomy.

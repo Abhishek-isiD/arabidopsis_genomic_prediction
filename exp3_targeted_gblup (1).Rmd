@@ -1,0 +1,265 @@
+---
+title: "Experiment 3: Targeted GBLUP -- does TARP's screening add anything on top of a dense kernel?"
+author: "Abck"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 9, fig.height = 5)
+knitr::opts_knit$set(root.dir = "~/arabidopsis_project")
+```
+
+## 1. Idea
+
+Experiment 0 showed that a dense genomic kernel (GBLUP) beats every screened method on FT10, so
+screening *alone* loses signal. But screening is good at one thing a dense ridge is not: it
+finds large-effect SNPs. This experiment keeps the dense kernel and adds TARP's own step 1
+(Bernoulli RIS screening) as a second kernel:
+
+    K = K_full + w * K_screened
+
+Each SNP has prior variance proportional to 1/p; screened SNPs get an extra w/p_screened, i.e. a
+prior-variance boost of about `1 + w * p / p_screened` (about 196 w for ~8.7k screened SNPs).
+`w = 0` is exactly GBLUP; very large `w` approaches screened-only ridge.
+
+**Honest protocol.** `w` and lambda are chosen by nested CV in which the screening is redone
+inside every inner fold, so the validation rows never influenced the screened set (the lesson of
+Experiments 1 and 1b). The outer test set is touched only at the end. Same seeds, splits and
+outer screened sets as every earlier run.
+
+```{r blas-fix}
+if (!requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+  stop("Run in terminal first: micromamba install -c conda-forge r-rhpcblasctl")
+}
+RhpcBLASctl::blas_set_num_threads(1)
+N_CORES <- 3
+N_REPS <- 10
+K_IN <- 5
+LAM_GRID <- 10^seq(-3, 3, length.out = 61)
+W_GRID <- c(0, 0.003, 0.01, 0.03, 0.1, 0.3, 1, 3)
+stopifnot(W_GRID[1] == 0)
+mem_check <- function(label) {
+  g <- gc(full = TRUE)
+  cat(sprintf("[memory] %s: %.0f MB in use\n", label, sum(g[, 2])))
+}
+```
+
+```{r load-once}
+library(bigsnpr); library(bigstatsr)
+obj.bigSNP <- snp_attach("arabidopsis_1135_matched.rds")
+G <- obj.bigSNP$genotypes; map <- obj.bigSNP$map; fam <- obj.bigSNP$fam
+pheno <- read.csv("flowering_time.csv")
+y_all <- pheno$FT10[match(as.character(fam$sample.ID), as.character(pheno$accession_id))]
+n <- nrow(G); p <- ncol(G)
+G2 <- snp_fastImputeSimple(G, method = "mean2", ncores = N_CORES)
+
+gr <- readRDS("gram_full_snp.rds"); Kfull <- gr$K        # built in Experiment 0
+stopifnot(nrow(Kfull) == n)
+cat("Loaded full-SNP Gram matrix:", dim(Kfull), "\n")
+mem_check("after loading")
+```
+
+## 2. Helpers
+
+```{r helpers}
+# TARP step 1 using ONLY the given training rows: marginal correlation -> |r|^delta -> Bernoulli draw
+screen_set <- function(tr_rows, y_tr_vec) {
+  gw <- big_univLinReg(G2, y.train = y_tr_vec, ind.train = tr_rows, ncores = N_CORES)
+  tt <- gw$estim / gw$std.err
+  r <- sign(tt) * sqrt(tt^2 / (tt^2 + (length(tr_rows) - 2))); r[is.na(r)] <- 0
+  delta <- max(0, (1 + log(p / length(tr_rows))) / 2)
+  q_in <- abs(r)^delta; q_in <- q_in / max(q_in)
+  list(inc = which(rbinom(p, 1, q_in) == 1), r = r)
+}
+
+# n x n kernel of the screened SNPs over ALL rows; standardized with all rows (no y involved),
+# matching how K_full was built
+screened_gram <- function(inc) {
+  Xs <- G2[, inc]
+  cs <- apply(Xs, 2, sd); keep <- cs > 0
+  Xs <- scale(Xs[, keep, drop = FALSE], center = TRUE, scale = cs[keep])
+  tcrossprod(Xs) / sum(keep)
+}
+
+# kernel ridge predictions of the centered response for EVERY lambda from one eigendecomposition
+kernel_curve <- function(K, K_new, y_c, lam_grid) {
+  eg <- eigen(K, symmetric = TRUE); e <- pmax(eg$values, 0); U <- eg$vectors
+  yt <- as.numeric(crossprod(U, y_c))
+  K_new %*% (U %*% (yt / outer(e, lam_grid, "+")))
+}
+mse_curve <- function(pred_c, y_new_c) colMeans((y_new_c - pred_c)^2)
+```
+
+## 3. One replication
+
+```{r replication-fn}
+run_rep <- function(seed_i) {
+  set.seed(seed_i)                                            # same RNG path as every earlier run
+  train_idx <- sample(seq_len(n), size = round(0.8 * n))
+  test_idx  <- setdiff(seq_len(n), train_idx)
+  y_tr <- y_all[train_idx]; y_te <- y_all[test_idx]; y_mean <- mean(y_tr)
+  sc <- screen_set(train_idx, y_tr)                           # outer screening (identical to before)
+  Ks_all <- screened_gram(sc$inc)
+
+  set.seed(seed_i * 1000 + 7)                                 # separate stream for inner folds
+  fold <- sample(rep(seq_len(K_IN), length.out = length(train_idx)))
+  cv <- array(0, c(K_IN, length(W_GRID), length(LAM_GRID)))
+  for (f in seq_len(K_IN)) {
+    in_tr <- train_idx[fold != f]; in_va <- train_idx[fold == f]
+    y_in <- y_all[in_tr]; ym <- mean(y_in)
+    sf <- screen_set(in_tr, y_in)                             # re-screen INSIDE the fold
+    Ks_f <- screened_gram(sf$inc)
+    for (iw in seq_along(W_GRID)) {
+      w <- W_GRID[iw]
+      Ktr <- Kfull[in_tr, in_tr] + w * Ks_f[in_tr, in_tr]
+      Kva <- Kfull[in_va, in_tr] + w * Ks_f[in_va, in_tr]
+      cv[f, iw, ] <- mse_curve(kernel_curve(Ktr, Kva, y_in - ym, LAM_GRID), y_all[in_va] - ym)
+    }
+  }
+  cvm <- apply(cv, c(2, 3), mean)                             # W x L
+  jl_w <- apply(cvm, 1, which.min)                            # best lambda for each w
+  best <- arrayInd(which.min(cvm), dim(cvm)); iw_star <- best[1, 1]; il_star <- best[1, 2]
+
+  te <- t(vapply(seq_along(W_GRID), function(iw) {            # outer fit, test MSPE for every (w, lambda)
+    w <- W_GRID[iw]
+    Ktr <- Kfull[train_idx, train_idx] + w * Ks_all[train_idx, train_idx]
+    Kte <- Kfull[test_idx, train_idx]  + w * Ks_all[test_idx, train_idx]
+    mse_curve(kernel_curve(Ktr, Kte, y_tr - y_mean, LAM_GRID), y_te - y_mean)
+  }, numeric(length(LAM_GRID))))                              # W x L
+
+  out <- data.frame(seed = seed_i, n_screened = length(sc$inc),
+                    TwoK_honest = te[iw_star, il_star],       # the method: (w, lambda) chosen by nested CV
+                    GBLUP_nested = te[1, jl_w[1]],            # w = 0 with lambda chosen the same way
+                    TwoK_oracle = min(te),                    # diagnostic only: peeks at the test set
+                    w_sel = W_GRID[iw_star], lam_sel = LAM_GRID[il_star], cv_min = min(cvm))
+  for (iw in seq_along(W_GRID)) out[[paste0("T_w", W_GRID[iw])]] <- te[iw, jl_w[iw]]
+  out
+}
+```
+
+## 4. Run with checkpointing (use tmux; roughly 1.5-2 minutes per seed)
+
+```{r run}
+ckpt <- "exp3_results.rds"
+res_list <- if (file.exists(ckpt)) readRDS(ckpt) else list()
+cat("Resuming with", length(res_list), "reps done\n")
+for (i in seq_len(N_REPS)) {
+  if (i <= length(res_list) && !is.null(res_list[[i]])) next
+  t0 <- Sys.time()
+  res_list[[i]] <- run_rep(i)
+  saveRDS(res_list, ckpt)
+  r_ <- res_list[[i]]
+  cat(sprintf("Rep %d/%d (%.1f min) | GBLUP_nested %.1f  TwoK_honest %.1f (w=%s)  | oracle %.1f\n",
+              i, N_REPS, as.numeric(difftime(Sys.time(), t0, units = "mins")),
+              r_$GBLUP_nested, r_$TwoK_honest, r_$w_sel, r_$TwoK_oracle))
+  mem_check(paste("rep", i))
+}
+all_res <- do.call(rbind, res_list)
+```
+
+## 5. Merge with earlier experiments and compare
+
+```{r summary}
+prev <- do.call(rbind, readRDS("si_replication_results.rds"))
+m <- match(all_res$seed, prev$seed)
+cat("screened counts identical to earlier runs:", all(all_res$n_screened == prev$n_screened[m]), "\n")
+all_res$RP_agg_old <- prev$RP_agg[m]
+if (file.exists("exp0_results.rds")) {
+  e0 <- readRDS("exp0_results.rds"); all_res$GBLUP_loo <- e0$Lin_loo[match(all_res$seed, e0$seed)]
+}
+if (file.exists("exp1b_results.rds")) {
+  e1b <- do.call(rbind, readRDS("exp1b_results.rds"))
+  all_res$Screened_lin_honest <- e1b$Lin_honest[match(all_res$seed, e1b$seed)]
+}
+
+meths <- intersect(c("Screened_lin_honest", "GBLUP_loo", "GBLUP_nested", "TwoK_honest", "TwoK_oracle"), names(all_res))
+meths <- c("RP_agg_old", meths)
+R <- nrow(all_res)
+summ <- data.frame(
+  Method = meths,
+  Mean_MSPE = sapply(meths, function(m) mean(all_res[[m]])),
+  Diff_vs_aggTARP = sapply(meths, function(m) mean(all_res[[m]] - all_res$RP_agg_old)),
+  SE = sapply(meths, function(m) sd(all_res[[m]] - all_res$RP_agg_old) / sqrt(R)),
+  Beats_aggTARP = sapply(meths, function(m) sum(all_res[[m]] < all_res$RP_agg_old))
+)
+rownames(summ) <- NULL
+knitr::kable(summ, digits = 2, caption = sprintf("%d seeds. TwoK_oracle peeks at the test set (diagnostic, not a method).", R))
+
+d <- all_res$TwoK_honest - all_res$GBLUP_nested
+cat(sprintf("\nTargeted GBLUP - GBLUP (both nested-tuned): mean %.2f, SE %.2f, targeted better in %d of %d seeds\n",
+            mean(d), sd(d) / sqrt(R), sum(d < 0), R))
+if ("GBLUP_loo" %in% names(all_res)) {
+  d2 <- all_res$TwoK_honest - all_res$GBLUP_loo
+  cat(sprintf("Targeted GBLUP - GBLUP (LOOCV, Experiment 0): mean %.2f, SE %.2f, targeted better in %d of %d seeds\n",
+              mean(d2), sd(d2) / sqrt(R), sum(d2 < 0), R))
+}
+cat("\nw chosen by nested CV, counts over seeds:\n"); print(table(all_res$w_sel))
+```
+
+## 6. The w-curve: how much does a prior-variance boost on screened SNPs help?
+
+```{r w-curve}
+wcols <- paste0("T_w", W_GRID)
+mu_w <- sapply(wcols, function(cn) mean(all_res[[cn]]))
+dmat <- sapply(wcols, function(cn) all_res[[cn]] - all_res$T_w0)
+wtab <- data.frame(w = W_GRID, prior_boost = 1 + W_GRID * p / mean(all_res$n_screened),
+                   Mean_MSPE = mu_w, Diff_vs_w0 = colMeans(dmat),
+                   SE = apply(dmat, 2, sd) / sqrt(R), Better_than_w0 = colSums(dmat < 0))
+knitr::kable(wtab, digits = 2, caption = "Each w uses its own nested-CV lambda; w = 0 is GBLUP")
+
+plot(seq_along(W_GRID), mu_w, type = "b", pch = 19, xaxt = "n", xlab = "w (weight on screened kernel)",
+     ylab = "mean test MSPE", main = "Targeted GBLUP: MSPE vs w")
+axis(1, at = seq_along(W_GRID), labels = W_GRID)
+if ("Screened_lin_honest" %in% names(all_res)) abline(h = mean(all_res$Screened_lin_honest), col = "firebrick", lty = 3)
+abline(h = mean(all_res$RP_agg_old), col = "darkgreen", lty = 3)
+legend("topright", c("screened-only honest ridge", "aggregated TARP"), col = c("firebrick", "darkgreen"), lty = 3, bty = "n")
+```
+
+## 7. Does screening recover the known flowering-time loci? (seed 1, training rows only)
+
+FRI (AT4G00650, chromosome 4) and FLC (AT5G10140, chromosome 5) are the classic large-effect
+flowering-time loci. The positions below are **approximate TAIR10 coordinates typed from memory**
+(FRI near 270 kb, FLC near 3.176 Mb): confirm them in TAIR before citing anything from this plot.
+
+```{r manhattan}
+set.seed(1)
+tr1 <- sample(seq_len(n), size = round(0.8 * n))
+gw1 <- big_univLinReg(G2, y.train = y_all[tr1], ind.train = tr1, ncores = N_CORES)
+t1 <- gw1$estim / gw1$std.err
+r1 <- sign(t1) * sqrt(t1^2 / (t1^2 + (length(tr1) - 2))); r1[is.na(r1)] <- 0
+
+chr <- suppressWarnings(as.integer(map$chromosome)); pos <- map$physical.pos
+ok <- !is.na(chr) & chr %in% 1:5
+chr_len <- tapply(pos[ok], chr[ok], max)
+off <- c(0, cumsum(as.numeric(chr_len))[-length(chr_len)]); names(off) <- names(chr_len)
+xcum <- pos + off[as.character(chr)]
+show <- ok & (abs(r1) > 0.15 | runif(p) < 0.05)
+plot(xcum[show], abs(r1)[show], pch = 16, cex = 0.3, col = c("grey40", "steelblue")[chr[show] %% 2 + 1],
+     xlab = "genome position (chromosomes 1-5 concatenated)", ylab = "|marginal correlation with FT10| (training rows)",
+     main = "Marginal association of every SNP with flowering time")
+fri <- off["4"] + 270000; flc <- off["5"] + 3176000
+abline(v = c(fri, flc), col = "red", lty = 2)
+text(c(fri, flc), max(abs(r1)), c("FRI (approx.)", "FLC (approx.)"), pos = 4, col = "red", cex = 0.8)
+
+o <- order(abs(r1), decreasing = TRUE)[1:15]
+top <- data.frame(chr = chr[o], pos = pos[o], r = round(r1[o], 3),
+                  dist_to_FRI_bp = ifelse(chr[o] == 4, abs(pos[o] - 270000), NA),
+                  dist_to_FLC_bp = ifelse(chr[o] == 5, abs(pos[o] - 3176000), NA))
+knitr::kable(top, caption = "Top 15 SNPs by |r| (training rows, seed 1)")
+```
+
+## 8. How to read this
+
+- **`TwoK_honest` clearly below `GBLUP_nested` (more than about 2 SE, most seeds):** TARP's targeted
+  screening adds information beyond a dense kernel. That is the headline result, and the w-curve
+  shows where the sweet spot sits.
+- **They tie and `w` is mostly 0 or tiny:** the screened SNPs add nothing beyond GBLUP on this
+  trait. That is a clean, well-controlled negative result and still worth reporting, together
+  with the Experiment 0 finding.
+- **The w-curve is U-shaped:** a moderate boost helps, and too much boost drifts toward the
+  screened-only ridge (the dotted red line).
+- **Manhattan plot:** if the strongest marginal signals sit on or near FRI / FLC, that is a
+  biological sanity check on the screening step, and a presentable figure.
+- Limits that still apply: one trait; the 10 splits share the same 1,003 accessions so SEs are
+  optimistic; the screened set is a single Bernoulli draw per fold.

@@ -1,0 +1,217 @@
+---
+title: "Ultrahigh-Dimensional Regression on *Arabidopsis thaliana*: RIS-RP, RIS-PCR, and GSIS"
+author: "Abck"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = "~/arabidopsis_project")
+```
+
+## 1. Data and cleaning summary
+
+**Source:** 1001 Genomes Project — whole-genome sequencing of 1,135 wild *Arabidopsis
+thaliana* accessions. Response variable: flowering time at 10°C (**FT10**), from
+AraPheno Study 12, phenotyped on the same accession panel.
+
+**Cleaning pipeline (`plink2`):**
+
+| Step | Filter | Variants remaining |
+|---|---|---|
+| Raw VCF | — | 12,883,854 |
+| Biallelic only | `--max-alleles 2` | 11,769,920 |
+| Missingness | `--geno 0.1` | 6,414,265 |
+| Rare variants | `--maf 0.01` | **1,712,884** |
+
+Samples were then restricted to accessions with **both** genotype and FT10 phenotype
+data (1,135 genotyped ∩ 1,163 phenotyped), giving a final matched working dataset of
+
+$$n = 1{,}003, \qquad p = 1{,}712{,}884$$
+
+Genotypes are coded 0/1/2 (reference/heterozygous/alternate allele dosage); this
+species self-pollinates, so empirically **zero heterozygous calls** exist in this
+dataset (confirmed via `big_counts()`). Residual missingness (~5% of calls, allowed by
+the `--geno 0.1` threshold) is mean-imputed via `bigsnpr::snp_fastImputeSimple()`
+before modeling.
+
+All three methods below share the same train/test split (`set.seed(42)`, 80/20) and
+the same closed-form Normal-Inverse-Gamma (NIG) Bayesian posterior at the final
+prediction stage — they differ only in how predictors are screened/compressed
+beforehand.
+
+## 2. Load and prepare data
+
+```{r load-data}
+library(bigsnpr)
+library(bigstatsr)
+
+obj.bigSNP <- snp_attach("arabidopsis_1135_matched.rds")
+G   <- obj.bigSNP$genotypes
+map <- obj.bigSNP$map
+fam <- obj.bigSNP$fam
+
+pheno <- read.csv("flowering_time.csv")
+y_all <- pheno$FT10[match(as.character(fam$sample.ID), as.character(pheno$accession_id))]
+
+n <- nrow(G); p <- ncol(G)
+cat("n =", n, " p =", p, "\n")
+stopifnot(sum(is.na(y_all)) == 0)
+
+G2 <- snp_fastImputeSimple(G, method = "mean2", ncores = 1)
+
+set.seed(42)
+train_idx <- sample(seq_len(n), size = round(0.8 * n))
+test_idx  <- setdiff(seq_len(n), train_idx)
+
+y_train <- y_all[train_idx]; y_test <- y_all[test_idx]
+y_mean  <- mean(y_train);    y_train_c <- y_train - y_mean
+baseline_mspe <- mean((y_test - y_mean)^2)
+
+cat("Train n =", length(train_idx), " Test n =", length(test_idx), "\n")
+cat("Mean-only baseline MSPE:", baseline_mspe, "\n")
+```
+
+## 3. Shared helper: NIG posterior fit + prediction
+
+Exact closed-form posterior from Mukhopadhyay & Dunson (2020), Section 2.2:
+$Z_n = X_nR_n'$, $W_n = (I+Z_n'Z_n)^{-1}$, $\mu_t = W_nZ_n'y_n$, with
+$\theta \mid R_n \sim t_{n+2a_\sigma}(\mu_t, \Sigma_t)$.
+
+```{r nig-helper}
+fit_nig_predict <- function(Z_train, Z_test, y_train_c, y_mean, y_test,
+                             a_sigma = 0.01, b_sigma = 0.01) {
+  m_n <- ncol(Z_train)
+  A <- diag(m_n) + t(Z_train) %*% Z_train
+  W <- solve(A)
+  mu_t <- W %*% t(Z_train) %*% y_train_c
+  pred_test <- (Z_test %*% mu_t) + y_mean
+  mspe <- mean((y_test - pred_test)^2)
+  list(mu_t = mu_t, pred_test = pred_test, mspe = mspe)
+}
+
+standardize_train_test <- function(X_train, X_test) {
+  col_mean <- colMeans(X_train)
+  col_sd   <- apply(X_train, 2, sd)
+  col_sd[col_sd == 0] <- 1
+  list(train = scale(X_train, center = col_mean, scale = col_sd),
+       test  = scale(X_test,  center = col_mean, scale = col_sd))
+}
+```
+
+## 4. Method 1 — RIS-RP (TARP): individual screening + random projection
+
+```{r method1-ris-rp}
+gwas <- big_univLinReg(G2, y.train = y_all, ncores = 1)
+t_stat <- gwas$estim / gwas$std.err
+r <- sign(t_stat) * sqrt(t_stat^2 / (t_stat^2 + (n - 2)))
+r[is.na(r)] <- 0   # monomorphic SNPs in this subset carry zero information
+
+delta <- max(0, (1 + log(p / n)) / 2)
+q <- abs(r)^delta; q <- q / max(q)
+
+set.seed(1)
+included_rp <- which(rbinom(p, 1, q) == 1)
+cat("delta =", delta, " | SNPs surviving RIS screening:", length(included_rp), "\n")
+
+X_s   <- G2[, included_rp]
+X_tr  <- standardize_train_test(X_s[train_idx, ], X_s[test_idx, ])
+
+m_n <- 100; psi <- 0.25
+set.seed(123)
+u <- runif(m_n * length(included_rp))
+Rmat <- matrix(0, m_n, length(included_rp)); val <- 1 / sqrt(2 * psi)
+Rmat[u < psi] <- val; Rmat[u >= psi & u < 2*psi] <- -val
+
+Z_train <- X_tr$train %*% t(Rmat); Z_test <- X_tr$test %*% t(Rmat)
+fit_rp <- fit_nig_predict(Z_train, Z_test, y_train_c, y_mean, y_test)
+cat("RIS-RP Test MSPE:", fit_rp$mspe, "\n")
+```
+
+## 5. Method 2 — RIS-PCR: same screening, PCA projection instead of random
+
+```{r method2-ris-pcr}
+pca <- prcomp(X_tr$train, center = FALSE, scale. = FALSE, rank. = m_n)
+V_m <- pca$rotation
+
+Z_train_pcr <- X_tr$train %*% V_m; Z_test_pcr <- X_tr$test %*% V_m
+fit_pcr <- fit_nig_predict(Z_train_pcr, Z_test_pcr, y_train_c, y_mean, y_test)
+cat("RIS-PCR Test MSPE:", fit_pcr$mspe, "\n")
+```
+
+## 6. Method 3 — GSIS: group-level screening (GiVSA)
+
+Groups here are **position-based windows** (100 consecutive SNPs per chromosome) —
+a practical stand-in for LD blocks/genes, used because no gene-annotation file has
+been loaded yet. This is flagged explicitly rather than presented as gene-level
+grouping.
+
+```{r method3-gsis}
+window_size <- 100
+group_id <- integer(p); counter <- 0
+for (chr in unique(map$chromosome)) {
+  idx_chr <- which(map$chromosome == chr)
+  g <- ceiling(seq_len(length(idx_chr)) / window_size) + counter
+  group_id[idx_chr] <- g
+  counter <- max(g)
+}
+group_list <- split(seq_len(p), group_id)
+n_groups <- length(group_list)
+cat("Number of groups:", n_groups, "(window size:", window_size, "SNPs)\n")
+
+gsis_q <- numeric(n_groups)
+for (k in seq_along(group_list)) {
+  cols_k <- group_list[[k]]
+  Xk <- scale(G2[train_idx, cols_k, drop = FALSE], center = TRUE, scale = FALSE)
+  XtX <- crossprod(Xk) + diag(1e-6, ncol(Xk))
+  beta <- tryCatch(solve(XtX, crossprod(Xk, y_train_c)), error = function(e) rep(0, ncol(Xk)))
+  gsis_q[k] <- sum((Xk %*% beta)^2) / length(cols_k)
+}
+
+q_g <- gsis_q / max(gsis_q)
+set.seed(1)
+group_included <- rbinom(n_groups, 1, q_g) == 1
+included_gsis <- unlist(group_list[group_included])
+cat("Groups surviving:", sum(group_included), "of", n_groups,
+    " -> SNPs surviving:", length(included_gsis), "\n")
+
+X_s_g  <- G2[, included_gsis]
+X_tr_g <- standardize_train_test(X_s_g[train_idx, ], X_s_g[test_idx, ])
+
+set.seed(123)
+u_g <- runif(m_n * length(included_gsis))
+Rmat_g <- matrix(0, m_n, length(included_gsis)); val_g <- 1 / sqrt(2 * psi)
+Rmat_g[u_g < psi] <- val_g; Rmat_g[u_g >= psi & u_g < 2*psi] <- -val_g
+
+Z_train_g <- X_tr_g$train %*% t(Rmat_g); Z_test_g <- X_tr_g$test %*% t(Rmat_g)
+fit_gsis <- fit_nig_predict(Z_train_g, Z_test_g, y_train_c, y_mean, y_test)
+cat("GSIS Test MSPE:", fit_gsis$mspe, "\n")
+```
+
+## 7. Results — three methods, one baseline, same split
+
+```{r results-table}
+results <- data.frame(
+  Method = c("Mean-only baseline", "RIS-RP (TARP)", "RIS-PCR", "GSIS (window-grouped)"),
+  Predictors_used = c(NA, length(included_rp), length(included_rp), length(included_gsis)),
+  Test_MSPE = c(baseline_mspe, fit_rp$mspe, fit_pcr$mspe, fit_gsis$mspe)
+)
+results$R2_vs_baseline <- 1 - results$Test_MSPE / baseline_mspe
+
+knitr::kable(results, digits = 3,
+             caption = "Out-of-sample MSPE, single 80/20 split, single random draw per method.")
+```
+
+## 8. Honest caveats
+
+- **Single split, single draw.** Each method uses one random train/test split and one
+  random projection draw. The TARP paper's own protocol averages over several
+  projection draws for exactly this reason — repeat with multiple seeds before
+  treating any one number here as stable.
+- **GSIS groups are position-based, not gene-based.** Swapping in real TAIR10
+  gene/LD-block annotations is the natural next step before calling this a genuine
+  group-informed comparison.
+- **All three share the same NIG prior hyperparameters** ($a_\sigma=b_\sigma=0.01$,
+  $m_n=100$, $\psi=0.25$) so the comparison isolates the screening/projection choice,
+  not tuning differences — but these were not themselves optimized.

@@ -1,0 +1,217 @@
+---
+title: "Experiment 0: Full-SNP GBLUP / kernel ridge -- the baseline that tests the screening premise"
+author: "Abck"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 9, fig.height = 5)
+knitr::opts_knit$set(root.dir = "~/arabidopsis_project")
+```
+
+## 1. Why this is the next experiment
+
+Every screened method so far (TARP, PCA, tuned ridge, RBF) starts by throwing away ~99.5% of
+the SNPs. The standard genomic-prediction baseline does not: **GBLUP**, i.e. ridge / kernel
+ridge on *all* markers through an n x n genomic relationship matrix. With n = 1,003 that matrix
+costs one pass over the genotypes (n^2 p flops), so it is feasible here even at p = 1.7M.
+
+Two things make this a clean test:
+
+1. **No supervised screening is involved**, so in-sample tuning (LOOCV, evidence) is valid
+   again; the selection bias from Experiments 1 / 1b does not apply.
+2. Same seeds and train/test splits as every earlier run, so paired comparisons are fair.
+
+Questions it answers: Does screening help or hurt accuracy? Does the RBF edge over a linear
+kernel survive when no screening has shaped the data?
+
+Standardization uses all 1,003 rows (means and SDs only, never `y`), which is the usual
+practice when building a genomic relationship matrix.
+
+```{r blas-fix}
+if (!requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+  stop("Run in terminal first: micromamba install -c conda-forge r-rhpcblasctl")
+}
+RhpcBLASctl::blas_set_num_threads(1)
+N_CORES <- 3
+N_REPS <- 10
+BLOCK <- 20000
+LAM_GRID <- 10^seq(-3, 3, length.out = 61)
+C_GRID <- c(0.25, 0.5, 1, 2, 4, 16)
+mem_check <- function(label) {
+  g <- gc(full = TRUE)
+  cat(sprintf("[memory] %s: %.0f MB in use\n", label, sum(g[, 2])))
+}
+```
+
+```{r load-once}
+library(bigsnpr); library(bigstatsr)
+obj.bigSNP <- snp_attach("arabidopsis_1135_matched.rds")
+G <- obj.bigSNP$genotypes; fam <- obj.bigSNP$fam
+pheno <- read.csv("flowering_time.csv")
+y_all <- pheno$FT10[match(as.character(fam$sample.ID), as.character(pheno$accession_id))]
+n <- nrow(G); p <- ncol(G)
+G2 <- snp_fastImputeSimple(G, method = "mean2", ncores = N_CORES)
+mem_check("after imputation")
+```
+
+## 2. The genomic relationship matrix over ALL SNPs (built blockwise, saved once)
+
+Each block of 20,000 SNPs is standardized and its n x n cross-product is accumulated. BLAS is
+allowed 3 threads here only (no bigstatsr parallel call is made inside this loop). Expect
+this one-time step to take on the order of 10-20 minutes; it is skipped if the file exists.
+
+```{r gram}
+gram_file <- "gram_full_snp.rds"
+if (!file.exists(gram_file)) {
+  RhpcBLASctl::blas_set_num_threads(N_CORES)
+  Kfull <- matrix(0, n, n); p_used <- 0
+  blocks <- split(seq_len(p), ceiling(seq_len(p) / BLOCK))
+  t0 <- Sys.time()
+  for (b in seq_along(blocks)) {
+    Xb <- G2[, blocks[[b]]]
+    cm <- colMeans(Xb); cs <- apply(Xb, 2, sd); keep <- cs > 0
+    Xb <- scale(Xb[, keep, drop = FALSE], center = cm[keep], scale = cs[keep])
+    Kfull <- Kfull + tcrossprod(Xb); p_used <- p_used + sum(keep)
+    rm(Xb)
+    if (b %% 10 == 0) cat(sprintf("block %d / %d  (%.1f min)\n", b, length(blocks),
+                                  as.numeric(difftime(Sys.time(), t0, units = "mins"))))
+  }
+  RhpcBLASctl::blas_set_num_threads(1)
+  saveRDS(list(K = Kfull / p_used, p_used = p_used), gram_file)
+  rm(Kfull); gc()
+}
+gr <- readRDS(gram_file); Kfull <- gr$K
+cat("Gram matrix:", dim(Kfull), " SNPs used (non-constant):", gr$p_used, "\n")
+cat("Mean diagonal (should be about 1):", mean(diag(Kfull)), "\n")
+```
+
+## 3. Helpers: all lambdas from one eigendecomposition, with LOOCV and closed-form evidence
+
+```{r helpers}
+log_evidence <- function(e_scaled, ytil2, rest_ss, n, a = 0.01, b = 0.01) {
+  s <- 1 + e_scaled
+  q <- sum(ytil2 / s) + rest_ss
+  -0.5 * sum(log(s)) + a * log(b) - lgamma(a) + lgamma(a + n / 2) - (a + n / 2) * log(b + 0.5 * q)
+}
+
+kernel_all <- function(K, K_new, y_c, y_new_c, lam_grid) {
+  n <- length(y_c)
+  eg <- eigen(K, symmetric = TRUE); e <- pmax(eg$values, 0); U <- eg$vectors
+  yt <- as.numeric(crossprod(U, y_c))
+  S <- outer(e, lam_grid, function(ei, li) ei / (ei + li))        # shrinkage factors, n x L
+  h <- (U^2) %*% S                                                # leverages
+  yhat <- U %*% (S * yt)                                          # in-sample fits
+  loo <- colMeans(((y_c - yhat) / pmax(1 - h, 1e-8))^2)           # closed-form LOOCV
+  ev <- vapply(lam_grid, function(l) log_evidence(e / l, yt^2, 0, n), numeric(1))
+  P <- K_new %*% (U %*% (yt / outer(e, lam_grid, "+")))           # predictions of centered response
+  test <- colMeans((y_new_c - P)^2)
+  list(loo = loo, ev = ev, test = test)
+}
+```
+
+## 4. One replication (same split as all earlier runs)
+
+```{r replication-fn}
+run_rep <- function(seed_i) {
+  set.seed(seed_i)
+  train_idx <- sample(seq_len(n), size = round(0.8 * n))
+  test_idx  <- setdiff(seq_len(n), train_idx)
+  y_tr <- y_all[train_idx]; y_te <- y_all[test_idx]; y_mean <- mean(y_tr)
+  y_c <- y_tr - y_mean; y_new_c <- y_te - y_mean
+
+  K_tt <- Kfull[train_idx, train_idx]; K_et <- Kfull[test_idx, train_idx]
+  out <- list(seed = seed_i)
+
+  lin <- kernel_all(K_tt, K_et, y_c, y_new_c, LAM_GRID)
+  il <- which.min(lin$loo); ie <- which.max(lin$ev)
+  out$Lin_loo <- lin$test[il]; out$Lin_evid <- lin$test[ie]; out$Lin_oracle <- min(lin$test)
+  out$lam_lin_loo <- LAM_GRID[il]; out$lam_lin_evid <- LAM_GRID[ie]
+
+  d_tr <- diag(K_tt); d_te <- diag(Kfull)[test_idx]
+  D_tt <- outer(d_tr, d_tr, "+") - 2 * K_tt
+  D_et <- outer(d_te, d_tr, "+") - 2 * K_et
+  th <- median(D_tt[upper.tri(D_tt)])
+  loo_min <- numeric(length(C_GRID)); ev_max <- numeric(length(C_GRID))
+  t_loo <- numeric(length(C_GRID)); t_ev <- numeric(length(C_GRID)); t_or <- numeric(length(C_GRID))
+  for (j in seq_along(C_GRID)) {
+    kk <- kernel_all(exp(-pmax(D_tt, 0) / (2 * C_GRID[j] * th)), exp(-pmax(D_et, 0) / (2 * C_GRID[j] * th)),
+                     y_c, y_new_c, LAM_GRID)
+    jl <- which.min(kk$loo); je <- which.max(kk$ev)
+    loo_min[j] <- kk$loo[jl]; ev_max[j] <- kk$ev[je]
+    t_loo[j] <- kk$test[jl]; t_ev[j] <- kk$test[je]; t_or[j] <- min(kk$test)
+  }
+  out$RBF_loo <- t_loo[which.min(loo_min)]; out$c_loo <- C_GRID[which.min(loo_min)]
+  out$RBF_evid <- t_ev[which.max(ev_max)];  out$c_evid <- C_GRID[which.max(ev_max)]
+  out$RBF_oracle <- min(t_or)
+  as.data.frame(out)
+}
+```
+
+## 5. Run (seconds per seed once the Gram matrix exists)
+
+```{r run}
+res_list <- lapply(seq_len(N_REPS), function(i) {
+  r_ <- run_rep(i)
+  cat(sprintf("Seed %d | full-SNP linear: LOO %.1f  evid %.1f | RBF: LOO %.1f (c=%s)  evid %.1f (c=%s)\n",
+              i, r_$Lin_loo, r_$Lin_evid, r_$RBF_loo, r_$c_loo, r_$RBF_evid, r_$c_evid))
+  r_
+})
+all_res <- do.call(rbind, res_list)
+saveRDS(all_res, "exp0_results.rds")
+```
+
+## 6. Compare with everything so far (same seeds)
+
+```{r summary}
+prev <- do.call(rbind, readRDS("si_replication_results.rds"))
+m <- match(all_res$seed, prev$seed)
+all_res$RP_agg_old <- prev$RP_agg[m]; all_res$PCA_old <- prev$PCA[m]; all_res$RKHS_old <- prev$RKHS[m]
+if (file.exists("exp1b_results.rds")) {
+  e1b <- do.call(rbind, readRDS("exp1b_results.rds")); m2 <- match(all_res$seed, e1b$seed)
+  all_res$Screened_lin_honest <- e1b$Lin_honest[m2]; all_res$Screened_RBF_honest <- e1b$RBF_honest[m2]
+}
+
+meths <- c("PCA_old", "RKHS_old", intersect(c("Screened_lin_honest", "Screened_RBF_honest"), names(all_res)),
+           "Lin_loo", "Lin_evid", "RBF_loo", "RBF_evid", "Lin_oracle", "RBF_oracle")
+ref <- "RP_agg_old"; R <- nrow(all_res)
+summ <- data.frame(
+  Method = meths,
+  Mean_MSPE = sapply(meths, function(m) mean(all_res[[m]])),
+  Diff_vs_aggTARP = sapply(meths, function(m) mean(all_res[[m]] - all_res[[ref]])),
+  SE = sapply(meths, function(m) sd(all_res[[m]] - all_res[[ref]]) / sqrt(R)),
+  Beats_aggTARP = sapply(meths, function(m) sum(all_res[[m]] < all_res[[ref]]))
+)
+rownames(summ) <- NULL
+knitr::kable(summ, digits = 2, caption = sprintf("%d seeds; reference = aggregated TARP (mean %.1f). Oracle rows peek at the test set.", R, mean(all_res[[ref]])))
+
+if ("Screened_lin_honest" %in% names(all_res)) {
+  d1 <- all_res$Lin_loo - all_res$Screened_lin_honest
+  d2 <- all_res$RBF_loo - all_res$Screened_RBF_honest
+  cat(sprintf("\nDoes screening help? full-SNP linear (LOO) - screened linear (honest): mean %.2f, SE %.2f, full-SNP better in %d/%d\n",
+              mean(d1), sd(d1) / sqrt(R), sum(d1 < 0), R))
+  cat(sprintf("                     full-SNP RBF (LOO) - screened RBF (honest):      mean %.2f, SE %.2f, full-SNP better in %d/%d\n",
+              mean(d2), sd(d2) / sqrt(R), sum(d2 < 0), R))
+}
+dn <- all_res$RBF_loo - all_res$Lin_loo
+cat(sprintf("Nonlinearity without any screening: RBF(LOO) - linear(LOO): mean %.2f, SE %.2f, RBF better in %d/%d\n",
+            mean(dn), sd(dn) / sqrt(R), sum(dn < 0), R))
+cat("Bandwidth multiplier chosen by LOO:\n"); print(table(all_res$c_loo))
+cat("Median log10(lambda), full-SNP linear: LOO", median(log10(all_res$lam_lin_loo)),
+    "| evidence", median(log10(all_res$lam_lin_evid)), "\n")
+```
+
+## 7. How to read this
+
+- **Full-SNP linear about equal to screened-honest linear:** screening costs nothing in accuracy,
+  and its value is purely computational at scales where an n x n Gram matrix over all markers
+  is out of reach. That is a more defensible claim than "screening improves prediction".
+- **Full-SNP clearly worse than screened:** screening is doing real work here, which fits flowering
+  time being driven by a few large-effect loci that a dense ridge dilutes.
+- **Full-SNP clearly better:** screening discards signal for this trait and the TARP-style premise
+  is weak on this dataset. That would be an important honest finding for the write-up.
+- **Nonlinearity row:** if RBF still beats linear here, the effect is not an artifact of screening
+  and is more credible. If it vanishes, the earlier edge came from how screening shaped the data.
+- Caveats that still apply: the 10 seeds share the same 1,003 accessions, so SEs are optimistic;
+  one trait only (FT10); and tuned ridge is being compared against untuned TARP / PCA.

@@ -1,0 +1,191 @@
+---
+title: "Properly Aggregated TARP + a New RKHS Extension"
+author: "Abck"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = "~/arabidopsis_project")
+```
+
+## 1. What this fixes and what it adds
+
+**Fix:** the paper's own recommended procedure aggregates RIS-RP over 100 realizations
+(varying both the projection matrix and $m_n$ within $[2\log p_n, 3n/4]$), specifically
+because RIS-RP is far more sensitive to a single random draw than RIS-PCR is -- this is
+stated explicitly in the paper. We never implemented this. Every prior RIS-RP number
+in this project is a single, unaggregated draw.
+
+**Addition:** a new method -- RIS screening (cheap, scalable to millions of SNPs) feeding
+into Gaussian-kernel RKHS regression (captures nonlinear/epistatic structure that no
+linear projection can), instead of a linear projection step. This combines two
+previously separate literatures: TARP's screening, and genomics' established RKHS
+tradition (de los Campos, Gianola, van Kaam).
+
+```{r blas-fix}
+if (!requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+  stop("Run in terminal first: micromamba install -c conda-forge r-rhpcblasctl")
+}
+RhpcBLASctl::blas_set_num_threads(1)
+N_CORES <- 3
+mem_check <- function(label) {
+  g <- gc(full = TRUE)
+  cat(sprintf("[memory] %s: %.0f MB in use\n", label, sum(g[, 2])))
+}
+```
+
+## 2. Load, split, leakage-free screening (Step 1 -- done ONCE, not repeated)
+
+```{r load-screen}
+library(bigsnpr); library(bigstatsr)
+
+obj.bigSNP <- snp_attach("arabidopsis_1135_matched.rds")
+G <- obj.bigSNP$genotypes; fam <- obj.bigSNP$fam
+pheno <- read.csv("flowering_time.csv")
+y_all <- pheno$FT10[match(as.character(fam$sample.ID), as.character(pheno$accession_id))]
+n <- nrow(G); p <- ncol(G)
+
+G2 <- snp_fastImputeSimple(G, method = "mean2", ncores = N_CORES)
+
+set.seed(42)
+train_idx <- sample(seq_len(n), size = round(0.8 * n))
+test_idx  <- setdiff(seq_len(n), train_idx)
+y_train <- y_all[train_idx]; y_test <- y_all[test_idx]
+y_mean  <- mean(y_train);    y_train_c <- y_train - y_mean
+baseline_mspe <- mean((y_test - y_mean)^2)
+
+gwas <- big_univLinReg(G2, y.train = y_train, ind.train = train_idx, ncores = N_CORES)
+t_stat <- gwas$estim / gwas$std.err
+r <- sign(t_stat) * sqrt(t_stat^2 / (t_stat^2 + (length(train_idx) - 2))); r[is.na(r)] <- 0
+
+delta <- max(0, (1 + log(p / length(train_idx))) / 2)
+q <- abs(r)^delta; q <- q / max(q)
+set.seed(1)
+included_rp <- which(rbinom(p, 1, q) == 1)
+cat("Screened SNPs (Step 1, fixed for all aggregation replicates):", length(included_rp), "\n")
+
+X_s <- G2[, included_rp]
+cm <- colMeans(X_s[train_idx, ]); cs <- apply(X_s[train_idx, ], 2, sd); cs[cs == 0] <- 1
+X_train_s <- scale(X_s[train_idx, ], center = cm, scale = cs)
+X_test_s  <- scale(X_s[test_idx, ],  center = cm, scale = cs)
+rm(X_s, G); mem_check("after screening")
+```
+
+## 3. Properly aggregated RIS-RP: 100 realizations, varying m_n, simple average
+
+```{r aggregated-ris-rp}
+N_AGG <- 100
+p_gamma <- length(included_rp)
+m_n_range <- c(2 * log(p), 3 * length(train_idx) / 4)
+cat("m_n range per paper spec:", m_n_range, "\n")
+
+psi <- 0.25
+pred_matrix <- matrix(NA, nrow = length(test_idx), ncol = N_AGG)
+
+for (b in seq_len(N_AGG)) {
+  m_n_b <- round(runif(1, m_n_range[1], m_n_range[2]))
+  u <- runif(m_n_b * p_gamma)
+  Rmat <- matrix(0, m_n_b, p_gamma); val <- 1 / sqrt(2 * psi)
+  Rmat[u < psi] <- val; Rmat[u >= psi & u < 2*psi] <- -val
+
+  Z_train <- X_train_s %*% t(Rmat); Z_test <- X_test_s %*% t(Rmat)
+  mu_t <- solve(diag(m_n_b) + t(Z_train) %*% Z_train) %*% t(Z_train) %*% y_train_c
+  pred_matrix[, b] <- (Z_test %*% mu_t) + y_mean
+}
+
+pred_aggregated <- rowMeans(pred_matrix)
+mspe_agg_ris_rp <- mean((y_test - pred_aggregated)^2)
+mspe_single_draw <- mean((y_test - pred_matrix[, 1])^2)  # for direct comparison
+
+cat("Single-draw RIS-RP MSPE (old approach):", mspe_single_draw, "\n")
+cat("Aggregated RIS-RP MSPE (100 draws, paper's actual method):", mspe_agg_ris_rp, "\n")
+mem_check("after aggregated RIS-RP")
+```
+
+## 4. RIS-PCR for comparison (deterministic, no aggregation needed)
+
+```{r ris-pcr}
+m_n <- 100
+pca <- prcomp(X_train_s, center = FALSE, scale. = FALSE, rank. = m_n)
+Z_train_pcr <- X_train_s %*% pca$rotation; Z_test_pcr <- X_test_s %*% pca$rotation
+mu_t_pcr <- solve(diag(m_n) + t(Z_train_pcr) %*% Z_train_pcr) %*% t(Z_train_pcr) %*% y_train_c
+mspe_pcr <- mean((y_test - ((Z_test_pcr %*% mu_t_pcr) + y_mean))^2)
+cat("RIS-PCR Test MSPE:", mspe_pcr, "\n")
+```
+
+## 5. New method: RIS screening + Gaussian-kernel RKHS regression
+
+Same screened SNPs as above, but instead of a linear projection, build a Gaussian
+kernel directly -- an infinite-dimensional feature map by Mercer's theorem -- and fit
+the closed-form kernel ridge / GP posterior. Bandwidth and ridge parameter chosen via
+an internal train-only validation split (never touches the test set).
+
+```{r rkhs}
+sq_dist <- function(A, B) {
+  outer(rowSums(A^2), rowSums(B^2), "+") - 2 * tcrossprod(A, B)
+}
+
+gaussian_kernel <- function(A, B, theta) exp(-sq_dist(A, B) / (2 * theta))
+
+# bandwidth: median-heuristic on training pairwise distances (standard default)
+D_train <- sq_dist(X_train_s, X_train_s)
+theta_default <- median(D_train[upper.tri(D_train)])
+cat("Gaussian kernel bandwidth (median heuristic):", theta_default, "\n")
+
+# internal train/validation split to pick lambda -- test set untouched
+set.seed(7)
+val_idx <- sample(seq_along(train_idx), size = round(0.15 * length(train_idx)))
+fit_idx <- setdiff(seq_along(train_idx), val_idx)
+
+X_fit <- X_train_s[fit_idx, ]; X_val <- X_train_s[val_idx, ]
+y_fit_c <- y_train_c[fit_idx]; y_val <- y_train[val_idx]
+
+lambda_grid <- c(0.1, 1, 5, 10, 50, 100)
+val_mspe <- sapply(lambda_grid, function(lam) {
+  K_fit <- gaussian_kernel(X_fit, X_fit, theta_default)
+  alpha <- solve(K_fit + lam * diag(nrow(K_fit)), y_fit_c)
+  K_val <- gaussian_kernel(X_val, X_fit, theta_default)
+  pred_val <- (K_val %*% alpha) + y_mean
+  mean((y_val - pred_val)^2)
+})
+best_lambda <- lambda_grid[which.min(val_mspe)]
+cat("Validation MSPE by lambda:\n"); print(data.frame(lambda = lambda_grid, val_mspe = round(val_mspe,2)))
+cat("Selected lambda:", best_lambda, "\n")
+
+# refit on full training set with selected lambda, evaluate on the real test set
+K_train <- gaussian_kernel(X_train_s, X_train_s, theta_default)
+alpha <- solve(K_train + best_lambda * diag(nrow(K_train)), y_train_c)
+K_test <- gaussian_kernel(X_test_s, X_train_s, theta_default)
+pred_rkhs <- (K_test %*% alpha) + y_mean
+mspe_rkhs <- mean((y_test - pred_rkhs)^2)
+cat("\nRIS + RKHS (Gaussian kernel) Test MSPE:", mspe_rkhs, "\n")
+mem_check("after RKHS")
+```
+
+## 6. Full comparison
+
+```{r final-comparison}
+results <- data.frame(
+  Method = c("Baseline", "RIS-RP (single draw, old)", "RIS-RP (aggregated, 100 draws, correct)",
+             "RIS-PCR", "RIS + RKHS (new, Gaussian kernel)"),
+  Test_MSPE = c(baseline_mspe, mspe_single_draw, mspe_agg_ris_rp, mspe_pcr, mspe_rkhs)
+)
+results$R2_vs_baseline <- round(1 - results$Test_MSPE / baseline_mspe, 3)
+knitr::kable(results, digits = 3, caption = "Aggregated TARP (correct) vs RIS-PCR vs new RKHS method.")
+saveRDS(results, "final_results_aggregated_rkhs.rds")
+```
+
+## 7. Honest read
+
+- If aggregated RIS-RP closes most of the gap to RIS-PCR, that confirms the paper's
+  own account: the previous gap was substantially an artifact of comparing an
+  unaggregated method to a deterministic one, not a real property of random vs PCA
+  projection.
+- If RKHS beats both, that's evidence nonlinear/epistatic structure in flowering time
+  is real and worth pursuing as the project's actual contribution -- a genuinely new
+  result, not a replication of either paper.
+- If RKHS does NOT beat linear methods, that's also a real, reportable finding:
+  additive (linear) effects dominate for this trait, and the extra complexity isn't
+  earning its keep -- equally worth knowing before investing further in this direction.

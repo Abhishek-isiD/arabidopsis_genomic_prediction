@@ -1,0 +1,1604 @@
+---
+title: "Screening, projection and dense kernels for ultra-high-dimensional genomic prediction: a replication, benchmark and calibration study of TARP on *Arabidopsis thaliana*"
+author: "Abck"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 9, fig.height = 5.5)
+PROJECT_DIR <- "~/arabidopsis_project"
+knitr::opts_knit$set(root.dir = PROJECT_DIR)
+```
+
+# 0. Overview
+
+**Goal.** Targeted Random Projection (TARP; Mukhopadhyay and Dunson) predicts a response from millions of
+predictors by (i) screening predictors with a randomized, correlation-based rule, (ii) compressing the survivors
+with a sparse random projection, and (iii) fitting a closed-form Normal-Inverse-Gamma (NIG) Bayesian regression
+on the compressed features, averaging over many projections. This document applies the method to a real
+ultra-high-dimensional problem, tests it against strong alternatives, and checks the quality of its predictions
+and prediction intervals.
+
+**Scope (project description).** The study explores variable selection and screening methods, with a focus on **randomized Sure Independence Screening (SIS) projections**, and compares their performance with other approaches. It examines dimensionality reduction (random projection, PCA, randomized SVD), prediction, and the effects of correlation (linkage disequilibrium) and genetic structure (ancestry, relatedness) among the covariates, to understand how incorporating the underlying structure of high-dimensional genetic data can improve statistical modelling and variable selection. *Terminology:* SIS (Fan and Lv, 2008) keeps the top-d predictors by absolute marginal correlation; TARP's first step is its randomized version, randomized independence screening (RIS); a "random SIS projection" is RIS followed by a sparse random projection (RIS-RP).
+
+**Data.** 1001 Genomes *Arabidopsis thaliana*: n = 1,003 accessions, p = 1,712,884 quality-filtered SNPs;
+response = days to flowering at 10 °C (FT10, AraPheno study 12). A second flowering trait (FT16, same accessions
+at 16 °C) is used for replication.
+
+**Questions.**
+
+1. Do the published TARP claims (aggregation needed; aggregated TARP comparable to PCA projection) hold on new data?
+2. How do SIS, randomized SIS (RIS), iterated SIS and structure-adjusted SIS compare, and what do they select when the
+   predictors are correlated (LD) and structured (ancestry)? Do they recover a planted truth?
+3. Which implementation pitfalls change the conclusions of a screen-then-fit pipeline?
+4. How does TARP compare with the standard dense baseline, GBLUP (kernel ridge on all SNPs)?
+5. Does adding TARP-style screening on top of a dense kernel, or screening groups of correlated SNPs, help?
+6. What is being predicted: population structure, relatedness, or within-lineage genetic signal?
+7. Are the prediction intervals calibrated, including within ancestry groups?
+8. Does the picture hold for a second trait?
+
+**Evaluation protocol (used throughout).** Ten random 80/20 train/test splits of the 1,003 accessions, identical
+across all experiments. Screening and all tuning use training rows only; the test set is touched once. Accuracy is
+test mean squared prediction error (MSPE) and R-squared `1 - MSPE/MSPE(mean-only)` per split. Comparisons are paired
+by split. The ten splits reuse the same accessions, so standard errors describe split-to-split variation only and
+are optimistic.
+
+**How this file runs.** It is self-contained. Heavy computations are cached in `cache/`; if the original checkpoint
+files from earlier development runs are present in the project folder they are reused, so a first render takes
+minutes. With no caches the full pipeline recomputes (several hours; progress is checkpointed per seed and
+resumable). Set `USE_CACHE <- FALSE` to force recomputation.
+
+```{r params}
+N_CORES <- 3            # worker cores for bigstatsr; BLAS is pinned to one thread (see helpers)
+N_REPS  <- 10           # random train/test splits per experiment
+K_IN    <- 5            # inner folds for nested ("honest") tuning
+USE_CACHE <- TRUE       # reuse cached results (cache/ or the original checkpoints) when present
+RUN_SCALING <- FALSE    # re-run the scaling benchmark (about 10 minutes); otherwise recorded values are shown
+K_DIM   <- 100          # dimension of the compressed space
+LAM_GRID <- 10^seq(-3, 3, length.out = 61)
+C_GRID  <- c(0.25, 0.5, 1, 2, 4, 16)                 # RBF bandwidth multipliers
+W_GRID  <- c(0, 0.003, 0.01, 0.03, 0.1, 0.3, 1, 3)   # weight on the screened kernel
+ALPHA <- 0.10; K_GROUPS <- 3; MIN_G <- 15            # conformal intervals
+# optional third trait (e.g. a DOG1-related germination trait): fill in and re-render
+THIRD_TRAIT <- list(file = NULL, id_col = "accession_id", y_col = NULL, name = "third trait")
+```
+
+# 1. Data and cleaning
+
+The raw data are the 1001 Genomes release v3.1 (1,135 accessions, 12,883,854 candidate variants, about 19 GB
+compressed) and the AraPheno flowering-time phenotypes (study 12). Cleaning is done once, outside R, with PLINK 2;
+the commands are recorded below (not evaluated when this file is rendered). The R code in this document starts from
+the PLINK output.
+
+```bash
+# 1. raw genotypes (about 19 GB)
+wget -c https://1001genomes.org/data/GMI-MPI/releases/v3.1/1001genomes_snp-short-indel_only_ACGTN.vcf.gz
+
+# 2. quality control and conversion to PLINK binary:
+#    biallelic sites only, at most 10% missing calls, minor allele frequency >= 1%
+plink2 --vcf 1001genomes_snp-short-indel_only_ACGTN.vcf.gz --allow-extra-chr --set-missing-var-ids @:# \
+       --maf 0.01 --geno 0.1 --max-alleles 2 --threads 8 --make-bed --out arabidopsis_1135
+
+# 3. phenotypes (FT10 and FT16 in one file)
+wget https://arapheno.1001genomes.org/rest/study/12/values.csv -O flowering_time.csv
+
+# 4. keep accessions that have BOTH genotype and phenotype
+awk '{print $2}' arabidopsis_1135.fam | sort -u > geno_ids.txt
+tail -n +2 flowering_time.csv | cut -d',' -f1 | sort -u > pheno_ids.txt
+comm -12 geno_ids.txt pheno_ids.txt > matched_ids.txt
+awk 'NR==FNR{a[$1];next} $2 in a {print $1, $2}' matched_ids.txt arabidopsis_1135.fam > keep_samples.txt
+plink2 --bfile arabidopsis_1135 --keep keep_samples.txt --make-bed --out arabidopsis_1135_matched
+```
+
+```{r cleaning-table}
+knitr::kable(data.frame(
+  Step = c("Raw VCF", "Biallelic sites only (--max-alleles 2)", "Missingness filter (--geno 0.1)",
+           "Rare-variant filter (--maf 0.01)", "Accessions with genotype and FT10 phenotype"),
+  Remaining = c("12,883,854 variants x 1,135 accessions", "11,769,920 variants", "6,414,265 variants (5,654,946 removed)",
+                "1,712,884 variants (4,402,090 removed)", "1,003 accessions (of 1,135 genotyped, 1,163 phenotyped)")),
+  caption = "Data cleaning, as logged by PLINK 2")
+```
+
+Two facts about the genotype matrix matter later. This species self-pollinates, so there are **no heterozygous calls**
+(every genotype is 0 or 2). About 5% of calls are missing (allowed by the 10% per-SNP threshold) and are mean-imputed
+for modeling.
+
+# 2. Setup and helper functions
+
+```{r packages}
+suppressPackageStartupMessages({ library(bigsnpr); library(bigstatsr); library(parallel) })
+if (!requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+  stop("Run once in a terminal: micromamba install -c conda-forge r-rhpcblasctl")
+}
+# bigstatsr refuses nested parallelism, so BLAS is pinned to one thread and parallelism comes from ncores
+RhpcBLASctl::blas_set_num_threads(1)
+dir.create("cache", showWarnings = FALSE)
+```
+
+```{r helpers}
+## ---------- generic infrastructure ----------
+# Run fun(seed) for every seed, checkpointing each seed (resumable); reuse a final cache or a legacy checkpoint.
+run_seeds <- function(name, fun, seeds = seq_len(N_REPS), legacy = NULL) {
+  final <- file.path("cache", paste0(name, ".rds"))
+  if (USE_CACHE && file.exists(final)) return(readRDS(final))
+  if (USE_CACHE && !is.null(legacy) && file.exists(legacy)) {
+    x <- readRDS(legacy); return(if (is.data.frame(x)) x else do.call(rbind, x))
+  }
+  part <- file.path("cache", paste0(name, "_partial.rds"))
+  res <- if (file.exists(part)) readRDS(part) else list()
+  for (s in seeds) {
+    if (length(res) >= s && !is.null(res[[s]])) next
+    t0 <- Sys.time(); res[[s]] <- fun(s); saveRDS(res, part)
+    cat(sprintf("[%s] seed %d done in %.1f min\n", name, s, as.numeric(difftime(Sys.time(), t0, units = "mins"))))
+  }
+  out <- do.call(rbind, res); saveRDS(out, final); out
+}
+make_split <- function(seed_i, pool = seq_len(n)) {      # same RNG path as every experiment
+  set.seed(seed_i)
+  tr <- sample(pool, size = round(0.8 * length(pool)))
+  list(tr = tr, te = setdiff(pool, tr))
+}
+sem <- function(x) sd(x) / sqrt(length(x))
+
+## ---------- TARP building blocks ----------
+# Step 1: randomized independence screening using ONLY the given training rows.
+screen_set <- function(tr_rows, y_vec) {
+  gw <- big_univLinReg(G2, y.train = y_vec, ind.train = tr_rows, ncores = N_CORES)
+  tt <- gw$estim / gw$std.err
+  r <- sign(tt) * sqrt(tt^2 / (tt^2 + (length(tr_rows) - 2))); r[is.na(r)] <- 0   # marginal correlation
+  delta <- max(0, (1 + log(p / length(tr_rows))) / 2)
+  q_in <- abs(r)^delta; q_in <- q_in / max(q_in)                                  # inclusion probabilities
+  list(inc = which(rbinom(p, 1, q_in) == 1), r = r)
+}
+std_cols <- function(Xs, tr_rows, other_rows) {          # standardize with training statistics only
+  cm <- colMeans(Xs[tr_rows, ]); cs <- apply(Xs[tr_rows, ], 2, sd); cs[cs == 0] <- 1
+  list(tr = scale(Xs[tr_rows, ], center = cm, scale = cs), other = scale(Xs[other_rows, ], center = cm, scale = cs))
+}
+screened_gram <- function(inc) {                          # n x n kernel of the screened SNPs over all rows
+  Xs <- G2[, inc]; cs <- apply(Xs, 2, sd); keep <- cs > 0
+  Xs <- scale(Xs[, keep, drop = FALSE], center = TRUE, scale = cs[keep])
+  tcrossprod(Xs) / sum(keep)
+}
+# Step 2: sparse ternary random matrix, entries +-1/sqrt(2 psi) with probability psi each
+tarp_omega <- function(p_gamma, l, psi = 0.25) {
+  u <- runif(p_gamma * l); Om <- matrix(0, p_gamma, l); val <- 1 / sqrt(2 * psi)
+  Om[u < psi] <- val; Om[u >= psi & u < 2 * psi] <- -val; Om
+}
+# Step 3: closed-form NIG fit on the compressed features; returns test MSPE
+nig_mspe <- function(Z_tr, Z_te, y_c, y_mean, y_te) {
+  m <- ncol(Z_tr); mu <- solve(diag(m) + crossprod(Z_tr), crossprod(Z_tr, y_c))
+  mean((y_te - ((Z_te %*% mu) + y_mean))^2)
+}
+# Paper's aggregation: B projections with m_n ~ U[2 log p, 3n/4], simple average of predictions
+agg_tarp_pred <- function(X_tr, X_te, y_c, y_mean, p_total, B = 100) {
+  p_g <- ncol(X_tr); n_tr <- nrow(X_tr); m_rng <- c(2 * log(p_total), 3 * n_tr / 4)
+  rowMeans(vapply(seq_len(B), function(b) {
+    m_b <- round(runif(1, m_rng[1], m_rng[2])); Om <- tarp_omega(p_g, m_b)
+    Z_tr <- X_tr %*% Om; Z_te <- X_te %*% Om
+    mu <- solve(diag(m_b) + crossprod(Z_tr), crossprod(Z_tr, y_c))
+    as.numeric((Z_te %*% mu) + y_mean)
+  }, numeric(nrow(X_te))))
+}
+# Randomized SVD (Halko-Martinsson-Tropp) with TARP's sparse matrix as the sketch and q power iterations
+rsvd_basis <- function(X, k, q, l = k + 10, psi = 0.25) {
+  Q <- qr.Q(qr(X %*% tarp_omega(ncol(X), l, psi)))
+  for (i in seq_len(q)) { W <- qr.Q(qr(crossprod(X, Q))); Q <- qr.Q(qr(X %*% W)) }
+  B <- crossprod(Q, X); e <- eigen(tcrossprod(B), symmetric = TRUE)
+  sweep(crossprod(B, e$vectors[, 1:k, drop = FALSE]), 2, sqrt(pmax(e$values[1:k], 1e-12)), "/")
+}
+gram_pca_basis <- function(X, k) {                        # exact PCA directions via the n x n Gram matrix
+  e <- eigen(tcrossprod(X), symmetric = TRUE)
+  sweep(crossprod(X, e$vectors[, 1:k, drop = FALSE]), 2, sqrt(e$values[1:k]), "/")
+}
+energy <- function(X, V) sum((X %*% V)^2)
+
+## ---------- kernel ridge / GBLUP building blocks ----------
+log_evidence <- function(e_scaled, ytil2, rest_ss, n_, a = 0.01, b = 0.01) {   # closed-form NIG marginal likelihood
+  s <- 1 + e_scaled; q <- sum(ytil2 / s) + rest_ss
+  -0.5 * sum(log(s)) + a * log(b) - lgamma(a) + lgamma(a + n_ / 2) - (a + n_ / 2) * log(b + 0.5 * q)
+}
+# one eigendecomposition gives LOOCV, evidence and test error for every lambda
+kernel_all <- function(K, K_new, y_c, y_new_c, lam_grid) {
+  n_ <- length(y_c)
+  eg <- eigen(K, symmetric = TRUE); e <- pmax(eg$values, 0); U <- eg$vectors
+  yt <- as.numeric(crossprod(U, y_c))
+  S <- outer(e, lam_grid, function(ei, li) ei / (ei + li))
+  h <- (U^2) %*% S; yhat <- U %*% (S * yt)
+  loo <- colMeans(((y_c - yhat) / pmax(1 - h, 1e-8))^2)
+  ev <- vapply(lam_grid, function(l) log_evidence(e / l, yt^2, 0, n_), numeric(1))
+  P <- K_new %*% (U %*% (yt / outer(e, lam_grid, "+")))
+  list(loo = loo, ev = ev, test = colMeans((y_new_c - P)^2), pred = P)
+}
+kernel_curve <- function(K, K_new, y_c, lam_grid) {       # predictions of the centered response for every lambda
+  eg <- eigen(K, symmetric = TRUE); e <- pmax(eg$values, 0); U <- eg$vectors
+  yt <- as.numeric(crossprod(U, y_c))
+  K_new %*% (U %*% (yt / outer(e, lam_grid, "+")))
+}
+mse_curve <- function(pred_c, y_new_c) colMeans((y_new_c - pred_c)^2)
+gblup_fit <- function(tr, te, y_tr, lam_grid = LAM_GRID) {  # GBLUP with LOOCV lambda (valid: no supervised screening)
+  ym <- mean(y_tr); kk <- kernel_all(Kfull[tr, tr], Kfull[te, tr], y_tr - ym, rep(0, length(te)), lam_grid)
+  il <- which.min(kk$loo); list(pred = kk$pred[, il] + ym, lam = lam_grid[il])
+}
+gdist <- function(rows, cols) outer(dK[rows], dK[cols], "+") - 2 * Kfull[rows, cols]   # squared genomic distance
+```
+
+
+# 3. Data description
+
+```{r load-data}
+if (!file.exists("arabidopsis_1135_matched.rds")) snp_readBed("arabidopsis_1135_matched.bed")
+obj.bigSNP <- snp_attach("arabidopsis_1135_matched.rds")
+G <- obj.bigSNP$genotypes; map <- obj.bigSNP$map; fam <- obj.bigSNP$fam
+if (!file.exists("flowering_time.csv")) {
+  download.file("https://arapheno.1001genomes.org/rest/study/12/values.csv", "flowering_time.csv", mode = "wb")
+}
+pheno <- read.csv("flowering_time.csv")
+y_all <- pheno$FT10[match(as.character(fam$sample.ID), as.character(pheno$accession_id))]   # main response
+y16   <- pheno$FT16[match(as.character(fam$sample.ID), as.character(pheno$accession_id))]   # second trait
+n <- nrow(G); p <- ncol(G)
+stopifnot(sum(is.na(y_all)) == 0)
+G2 <- snp_fastImputeSimple(G, method = "mean2", ncores = N_CORES)   # mean-imputed copy used for modeling
+cat("accessions n =", n, "| SNPs p =", format(p, big.mark = ","), "| p/n =", round(p / n), "\n")
+```
+
+```{r genotype-summary, fig.height = 4.5}
+cnt <- big_counts(G)                                  # rows: genotype 0, 1, 2, NA ; one column per SNP
+tot <- rowSums(cnt)
+geno_tab <- data.frame(State = c("0 (reference allele)", "1 (heterozygous)", "2 (alternate allele)", "missing"),
+                       Calls = tot, Share = tot / sum(tot))
+knitr::kable(geno_tab, digits = 4, row.names = FALSE, format.args = list(big.mark = ","),
+             caption = "Genotype calls over all accessions and SNPs (zero heterozygotes: the species self-pollinates)")
+f_alt <- cnt[3, ] / pmax(cnt[1, ] + cnt[3, ], 1); maf <- pmin(f_alt, 1 - f_alt); miss <- cnt[4, ] / n
+par(mfrow = c(1, 3))
+barplot(tot / sum(tot), names.arg = c("0", "1 (het)", "2", "NA"), col = "steelblue", border = NA,
+        ylab = "share of calls", main = "Genotype states")
+hist(maf, breaks = 40, col = "steelblue", border = "white", xlab = "minor allele frequency", main = "MAF of the 1.7M SNPs")
+hist(miss, breaks = 40, col = "steelblue", border = "white", xlab = "fraction of accessions missing", main = "Per-SNP missingness")
+par(mfrow = c(1, 1))
+```
+
+```{r phenotype-plots, fig.height = 4.5}
+ok16 <- !is.na(y16)
+par(mfrow = c(1, 3))
+hist(y_all, breaks = 30, col = "steelblue", border = "white", xlab = "days", main = "FT10: days to flowering at 10 C")
+hist(y16[ok16], breaks = 30, col = "darkorange", border = "white", xlab = "days", main = "FT16: days to flowering at 16 C")
+plot(y_all[ok16], y16[ok16], pch = 16, cex = 0.5, col = rgb(0, 0, 0, 0.35), xlab = "FT10", ylab = "FT16",
+     main = sprintf("FT10 vs FT16 (r = %.2f)", cor(y_all[ok16], y16[ok16])))
+par(mfrow = c(1, 1))
+cat(sprintf("FT10: mean %.1f, sd %.1f, range %.0f-%.0f days (n = %d).  FT16 available for %d of these accessions.\n",
+            mean(y_all), sd(y_all), min(y_all), max(y_all), n, sum(ok16)))
+```
+
+FT16 is the same panel measured at a second temperature, so it is strongly correlated with FT10: it is a replication
+on a **related** trait, not a trait with an independent genetic architecture.
+
+## 3.1 Genome-wide relationship matrix and population structure
+
+GBLUP, the dense baseline used below, needs the n x n genomic relationship matrix over **all** SNPs. It is built in
+one blockwise pass (20,000 SNPs per block; each block standardized with all accessions, no response involved) and
+cached; this one-time pass takes on the order of 20 minutes and is reused for every trait and split.
+
+```{r gram}
+gram_file <- "gram_full_snp.rds"
+if (!file.exists(gram_file)) {
+  RhpcBLASctl::blas_set_num_threads(N_CORES)                 # no bigstatsr parallel call inside this loop
+  Kfull <- matrix(0, n, n); p_used <- 0
+  blocks <- split(seq_len(p), ceiling(seq_len(p) / 20000)); t0 <- Sys.time()
+  for (b in seq_along(blocks)) {
+    Xb <- G2[, blocks[[b]]]; cm <- colMeans(Xb); cs <- apply(Xb, 2, sd); keep <- cs > 0
+    Xb <- scale(Xb[, keep, drop = FALSE], center = cm[keep], scale = cs[keep])
+    Kfull <- Kfull + tcrossprod(Xb); p_used <- p_used + sum(keep); rm(Xb)
+    if (b %% 10 == 0) cat(sprintf("Gram block %d / %d (%.1f min)\n", b, length(blocks), as.numeric(difftime(Sys.time(), t0, units = "mins"))))
+  }
+  RhpcBLASctl::blas_set_num_threads(1)
+  saveRDS(list(K = Kfull / p_used, p_used = p_used), gram_file); rm(Kfull)
+}
+gr <- readRDS(gram_file); Kfull <- gr$K; dK <- diag(Kfull)
+cat("Gram matrix", dim(Kfull), "built from", format(gr$p_used, big.mark = ","), "non-constant SNPs; mean diagonal", round(mean(dK), 3), "\n")
+```
+
+```{r structure-plot, fig.height = 5}
+eK <- eigen(Kfull, symmetric = TRUE)
+pcs5 <- sweep(eK$vectors[, 1:5], 2, sqrt(eK$values[1:5]), "*")        # top genomic axes (ancestry gradients)
+var_share <- eK$values / sum(eK$values)
+col_ft <- colorRampPalette(c("blue", "yellow", "red"))(100)[cut(y_all, 100, labels = FALSE)]
+par(mfrow = c(1, 2))
+barplot(100 * var_share[1:15], names.arg = 1:15, col = "steelblue", border = NA, xlab = "genomic axis",
+        ylab = "% of genome-wide variance", main = "Population structure: kernel eigenvalues")
+plot(pcs5[, 1], pcs5[, 2], pch = 16, cex = 0.6, col = col_ft, xlab = "axis 1", ylab = "axis 2",
+     main = "Accessions on the first two axes\n(blue = early flowering, red = late)")
+par(mfrow = c(1, 1))
+cat(sprintf("The first axis alone carries %.1f%% of genome-wide variance; the first five carry %.1f%%.\n",
+            100 * var_share[1], 100 * sum(var_share[1:5])))
+```
+
+One axis dominates the genome-wide variation and the phenotype varies along it: ancestry and flowering time are
+entangled. That is why population structure, relatedness and within-lineage signal are separated explicitly in
+Section 7.
+
+```{r groups}
+# three ancestry clusters from the first five axes (unsupervised, no response); used for Mondrian conformal intervals
+set.seed(2024)
+grp <- kmeans(pcs5, centers = K_GROUPS, nstart = 25)$cluster
+cat("ancestry cluster sizes:", paste(table(grp), collapse = " / "), "| mean FT10 by cluster:",
+    paste(round(tapply(y_all, grp, mean), 1), collapse = " / "), "\n")
+```
+
+# 4. Replicating TARP: aggregation, PCA projection and randomized SVD
+
+**Method (TARP, per the paper).** For each SNP compute its marginal correlation $r_j$ with the response; keep it with
+probability $q_j \propto |r_j|^{\delta}$, $\delta = \max\{0,(1+\log(p/n))/2\}$; compress the $p_\gamma$ survivors with a
+sparse random matrix $R$ (entries $\pm 1/\sqrt{2\psi}$ w.p. $\psi$, else 0) to $Z = XR'$ and fit the conjugate model
+$y = Z\theta + \varepsilon$ with prior $\theta\mid\sigma^2 \sim N(0,\sigma^2 I)$, giving
+$\mu_t = (I + Z'Z)^{-1}Z'y$ and a Student-t predictive distribution. A **single** projection is noisy, so the paper
+averages predictions over 100 projections with $m_n \sim U[2\log p,\,3n/4]$.
+
+**Variants compared on the same screened SNPs.** (i) one projection, (ii) the 100-draw aggregation, (iii) exact PCA
+projection (RIS-PCR), and (iv) a randomized-SVD projection that uses TARP's own sparse matrix as the sketch followed by
+`q` power iterations: `q = 0` is a data-adaptive rotation of one sketch, and `q -> infinity` recovers PCA, so `q` is a
+single knob between random projection and PCA.
+
+```{r si-run}
+QS <- c(0, 1, 2, 4)
+run_rep_si <- function(seed_i) {
+  sp <- make_split(seed_i); tr <- sp$tr; te <- sp$te
+  y_tr <- y_all[tr]; y_te <- y_all[te]; y_mean <- mean(y_tr); y_c <- y_tr - y_mean
+  sc <- screen_set(tr, y_tr)                                  # RNG continues straight from the split
+  X <- std_cols(G2[, sc$inc], tr, te); X_tr <- X$tr; X_te <- X$other; p_g <- ncol(X_tr)
+  out <- list(seed = seed_i, baseline = mean((y_te - y_mean)^2), n_screened = p_g)
+  tm <- system.time({ pca <- prcomp(X_tr, center = FALSE, scale. = FALSE, rank. = K_DIM) })[["elapsed"]]
+  V_pca <- pca$rotation[, 1:K_DIM]
+  out$PCA <- nig_mspe(X_tr %*% V_pca, X_te %*% V_pca, y_c, y_mean, y_te); out$t_PCA <- tm
+  E_pca <- energy(X_tr, V_pca)
+  Om <- tarp_omega(p_g, K_DIM); out$RP_single <- nig_mspe(X_tr %*% Om, X_te %*% Om, y_c, y_mean, y_te)
+  tm <- system.time({ pa <- agg_tarp_pred(X_tr, X_te, y_c, y_mean, p, B = 100) })[["elapsed"]]
+  out$RP_agg <- mean((y_te - pa)^2); out$t_RP_agg <- tm
+  for (qq in QS) {
+    tm <- system.time({ V <- rsvd_basis(X_tr, K_DIM, qq) })[["elapsed"]]
+    out[[paste0("SI_q", qq)]] <- nig_mspe(X_tr %*% V, X_te %*% V, y_c, y_mean, y_te)
+    out[[paste0("E_q", qq)]] <- energy(X_tr, V) / E_pca; out[[paste0("t_q", qq)]] <- tm
+  }
+  as.data.frame(out)
+}
+si <- run_seeds("si", run_rep_si, legacy = "si_replication_results.rds")
+base_s <- setNames(si$baseline, si$seed)             # per-split mean-only MSPE, shared by every experiment
+r2_of <- function(v, seeds = names(v)) 1 - v / base_s[seeds]
+cat("splits:", nrow(si), "| SNPs surviving screening per split (mean):", round(mean(si$n_screened)), "\n")
+```
+
+```{r si-plots, fig.height = 5.5}
+cols <- c("RP_single", "RP_agg", "PCA", paste0("SI_q", QS))
+lab  <- c("TARP\nsingle draw", "TARP\naggregated", "PCA", paste0("rSVD\nq=", QS))
+par(mfrow = c(1, 2), mar = c(6, 4, 3, 1))
+boxplot(si[, cols], names = lab, las = 2, cex.axis = 0.75, col = c("firebrick", "darkgreen", "steelblue", rep("grey70", length(QS))),
+        ylab = "test MSPE", main = "Projection variants on the same screened SNPs")
+abline(h = mean(si$baseline), lty = 3); text(1, mean(si$baseline), "mean-only predictor", pos = 3, cex = 0.7)
+mu_q <- sapply(QS, function(q) mean(si[[paste0("SI_q", q)]])); se_q <- sapply(QS, function(q) sem(si[[paste0("SI_q", q)]]))
+plot(QS, mu_q, type = "b", pch = 19, ylim = range(c(mu_q - 2 * se_q, mu_q + 2 * se_q, mean(si$PCA), mean(si$RP_agg))),
+     xlab = "power iterations q", ylab = "mean test MSPE (+-2 SE)", main = "Randomized SVD between random projection and PCA")
+arrows(QS, mu_q - 2 * se_q, QS, mu_q + 2 * se_q, angle = 90, code = 3, length = 0.04)
+abline(h = mean(si$PCA), col = "blue", lty = 2); abline(h = mean(si$RP_agg), col = "darkgreen", lty = 3)
+legend("topright", c("exact PCA", "TARP aggregated"), col = c("blue", "darkgreen"), lty = c(2, 3), bty = "n", cex = 0.8)
+par(mfrow = c(1, 1))
+d_pca <- sapply(c("RP_single", "RP_agg", paste0("SI_q", QS)), function(m) si[[m]] - si$PCA)
+knitr::kable(data.frame(Method = colnames(d_pca), Mean_MSPE = sapply(colnames(d_pca), function(m) mean(si[[m]])),
+                        Diff_vs_PCA = colMeans(d_pca), SE = apply(d_pca, 2, sem), Beats_PCA = colSums(d_pca < 0)),
+             digits = 2, row.names = FALSE, caption = "Paired differences against exact PCA (negative = better than PCA)")
+```
+
+```{r si-cost}
+tab_cost <- data.frame(q = c(QS, Inf),
+  Energy_vs_PCA = c(sapply(QS, function(q) mean(si[[paste0("E_q", q)]])), 1),
+  Seconds = c(sapply(QS, function(q) mean(si[[paste0("t_q", q)]])), mean(si$t_PCA)))
+knitr::kable(tab_cost, digits = 3, caption = "Share of exact-PCA captured energy and mean wall time (single-threaded BLAS)")
+cat("Aggregated TARP: median wall time per split", round(median(si$t_RP_agg)), "seconds (the mean is distorted by any pause of the machine).\n")
+```
+
+**Scaling benchmark.** Wall time for exact SVD (`prcomp`), exact PCA through the n x n Gram matrix, randomized SVD
+(q = 2) and the paper's 100-draw aggregation (extrapolated from 5 draws) as the number of screened SNPs grows. Unless
+`RUN_SCALING <- TRUE`, the values recorded in the original run (single-threaded, same laptop) are shown.
+
+```{r scaling}
+scaling <- data.frame(p_screened = c(5000, 20000, 50000, 100000),
+  exact_svd = c(8.953, 35.725, 91.573, 189.92), exact_gram = c(2.822, 11.013, 23.434, 47.048),
+  rsvd_q2 = c(2.23, 9.163, 24.314, 47.25), tarp_agg100_extrap = c(86.96, 366.92, 908.38, 1796.46),
+  rsvd_energy_vs_exact = c(0.9975744, 0.9951787, 0.9925784, 0.9891172))
+if (RUN_SCALING) {
+  sp1 <- make_split(1); gw <- big_univLinReg(G2, y.train = y_all[sp1$tr], ind.train = sp1$tr, ncores = N_CORES)
+  ord <- order(abs(gw$estim / gw$std.err), decreasing = TRUE); ord[is.na(ord)] <- length(ord)
+  scaling <- do.call(rbind, lapply(scaling$p_screened, function(K) {
+    X <- G2[sp1$tr, ord[1:K]]; cs <- apply(X, 2, sd); cs[cs == 0] <- 1; X <- scale(X, center = TRUE, scale = cs)
+    t_svd <- system.time(prcomp(X, center = FALSE, scale. = FALSE, rank. = K_DIM))[["elapsed"]]
+    t_gram <- system.time(Vg <- gram_pca_basis(X, K_DIM))[["elapsed"]]
+    t_rsvd <- system.time(Vr <- rsvd_basis(X, K_DIM, 2))[["elapsed"]]
+    t_agg5 <- system.time(for (b in 1:5) { Zb <- X %*% tarp_omega(K, 315) })[["elapsed"]]
+    data.frame(p_screened = K, exact_svd = t_svd, exact_gram = t_gram, rsvd_q2 = t_rsvd,
+               tarp_agg100_extrap = t_agg5 * 20, rsvd_energy_vs_exact = energy(X, Vr) / energy(X, Vg))
+  }))
+}
+knitr::kable(scaling, digits = 3, caption = "Seconds to obtain 100 projection directions (and rSVD energy relative to exact)")
+matplot(scaling$p_screened, scaling[, c("exact_svd", "exact_gram", "rsvd_q2", "tarp_agg100_extrap")], type = "b", pch = 1:4,
+        lty = 1, log = "xy", col = c("grey40", "blue", "steelblue", "darkgreen"), xlab = "screened SNPs (log scale)",
+        ylab = "seconds (log scale)", main = "Cost of compressing the screened SNPs")
+legend("topleft", c("exact SVD", "exact PCA via Gram matrix", "randomized SVD (q = 2)", "TARP, 100 draws (extrapolated)"),
+       col = c("grey40", "blue", "steelblue", "darkgreen"), pch = 1:4, lty = 1, bty = "n", cex = 0.8)
+```
+
+```{r si-findings, results='asis'}
+d_agg <- si$RP_agg - si$PCA
+cat(sprintf("- **A single random projection is unreliable**: mean MSPE %.1f, against %.1f for the 100-draw aggregation and %.1f for exact PCA (mean-only predictor: %.1f).\n",
+            mean(si$RP_single), mean(si$RP_agg), mean(si$PCA), mean(si$baseline)))
+cat(sprintf("- **Aggregated TARP matches exact PCA** (difference %.1f, SE %.1f; aggregation wins in %d of %d splits), reproducing the paper's statement that RIS-RP and RIS-PCR are comparable.\n",
+            mean(d_agg), sem(d_agg), sum(d_agg < 0), nrow(si)))
+cat(sprintf("- **Randomized SVD closes the gap to PCA as q grows**: mean difference from PCA %.1f at q = 0 and %.1f at q = 2, recovering %.1f%% of the exact captured energy at q = 2.\n",
+            mean(si$SI_q0 - si$PCA), mean(si$SI_q2 - si$PCA), 100 * mean(si$E_q2)))
+cat(sprintf("- **Cost**: at 100,000 screened SNPs, randomized SVD (q = 2) takes %.0f s versus about %.0f s for the 100-draw aggregation (%.0fx cheaper) and %.0f s for exact SVD; exact PCA through the Gram matrix is just as fast as randomized SVD (%.0f s), so the saving is relative to the aggregation, not to PCA.\n",
+            scaling$rsvd_q2[4], scaling$tarp_agg100_extrap[4], scaling$tarp_agg100_extrap[4] / scaling$rsvd_q2[4],
+            scaling$exact_svd[4], scaling$exact_gram[4]))
+```
+
+
+# 5. Screening and variable selection: SIS, randomized SIS, iterated SIS and structure-adjusted SIS
+
+**Terminology.** *Sure Independence Screening* (SIS; Fan and Lv, 2008) ranks predictors by the absolute marginal
+correlation $|r_j|$ with the response and keeps the top $d$ (default $d=\lfloor n/\log n\rfloor$, here 120 for
+n = 802 training accessions). TARP's first step is the *randomized* version, **randomized independence screening
+(RIS)**: SNP $j$ survives with probability $q_j\propto|r_j|^{\delta}$, a soft threshold with no hard cutoff.
+**"Random SIS projection" = RIS followed by a sparse random projection (RIS-RP)**, the method evaluated in
+Section 4. This section studies the screening step itself, how it behaves when predictors are strongly correlated
+(linkage disequilibrium, LD) and structured (ancestry), and how it compares with the alternatives:
+
+| Screen | Rule |
+|---|---|
+| `SIS` (d = n/log n, 2000, or the RIS survivor count) | deterministic top-$d$ by absolute marginal correlation |
+| `RIS` | Bernoulli($q_j$) with $q_j$ proportional to (absolute marginal correlation)$^{\delta}$ (TARP step 1) |
+| `ISIS` | iterated SIS: select, fit a lasso, take residuals, re-screen (3 rounds) |
+| `SISadj` | SIS on the response after removing the first five genomic (ancestry) axes |
+
+After screening, the survivors are modeled with the lasso, ridge or elastic net (`glmnet`), the standard
+"SIS + penalized regression" recipe, and compared with TARP's projections and with the dense GBLUP baseline.
+
+```{r sis-helpers}
+HAS_GLMNET <- requireNamespace("glmnet", quietly = TRUE)
+if (!HAS_GLMNET) message("glmnet is not installed: lasso/ridge-after-screening rows are skipped. ",
+                         "Install once with: micromamba install -c conda-forge r-glmnet")
+screen_scores <- function(tr_rows, y_vec) {              # signed t-statistic of every SNP against y_vec (training rows only)
+  gw <- big_univLinReg(G2, y.train = y_vec, ind.train = tr_rows, ncores = N_CORES)
+  tt <- gw$estim / gw$std.err; tt[is.na(tt)] <- 0; tt
+}
+sis_top <- function(score, d) order(abs(score), decreasing = TRUE)[1:d]
+adjust_response <- function(tr_rows, y_vec) resid(lm(y_vec ~ pcs5[tr_rows, , drop = FALSE]))   # remove ancestry axes
+isis_set <- function(tr_rows, y_vec, d_total, n_iter = 3) {
+  d_step <- ceiling(d_total / n_iter); sel <- integer(0); y_c <- y_vec - mean(y_vec); y_res <- y_c
+  for (it in seq_len(n_iter)) {
+    tt <- screen_scores(tr_rows, y_res); tt[sel] <- 0
+    sel <- c(sel, order(abs(tt), decreasing = TRUE)[1:d_step])
+    if (it < n_iter) {
+      Xs <- scale(G2[tr_rows, sel, drop = FALSE]); Xs[is.na(Xs)] <- 0
+      fit <- if (HAS_GLMNET) {
+        cv <- glmnet::cv.glmnet(Xs, y_c, alpha = 1, nfolds = 5); as.numeric(predict(cv, Xs, s = "lambda.min"))
+      } else {
+        as.numeric(Xs %*% solve(crossprod(Xs) + 0.1 * length(tr_rows) * diag(ncol(Xs)), crossprod(Xs, y_c)))
+      }
+      y_res <- y_c - fit
+    }
+  }
+  sel
+}
+# penalized fit on a screened set; lambda by glmnet's internal 10-fold CV (in-sample, so subject to the screening
+# bias discussed in Section 6, but the test MSPE below is untouched by it); optionally ancestry axes unpenalized
+pen_fit <- function(sel, tr, te, y_tr, y_te, alpha, pcs_cov = FALSE) {
+  if (!HAS_GLMNET) return(c(mspe = NA_real_, nz = NA_real_))
+  X <- std_cols(G2[, sel, drop = FALSE], tr, te); keep <- apply(X$tr, 2, sd) > 1e-8
+  x_tr <- X$tr[, keep, drop = FALSE]; x_te <- X$other[, keep, drop = FALSE]; pf <- rep(1, ncol(x_tr))
+  if (pcs_cov) { x_tr <- cbind(pcs5[tr, ], x_tr); x_te <- cbind(pcs5[te, ], x_te); pf <- c(rep(0, ncol(pcs5)), pf) }
+  cv <- glmnet::cv.glmnet(x_tr, y_tr, alpha = alpha, nfolds = 10, penalty.factor = pf)
+  pr <- as.numeric(predict(cv, x_te, s = "lambda.min"))
+  c(mspe = mean((y_te - pr)^2), nz = sum(as.numeric(coef(cv, s = "lambda.min"))[-1] != 0))
+}
+```
+
+## 5.1 Prediction after screening: SIS, RIS, ISIS and structure-adjusted SIS with penalized regression
+
+```{r sis-run}
+run_rep_sis <- function(seed_i) {
+  sp <- make_split(seed_i); tr <- sp$tr; te <- sp$te
+  y_tr <- y_all[tr]; y_te <- y_all[te]; ym <- mean(y_tr)
+  sc <- screen_set(tr, y_tr)                                 # RIS survivors
+  tt <- screen_scores(tr, y_tr)
+  d1 <- floor(length(tr) / log(length(tr))); d2 <- 2000; dR <- length(sc$inc)
+  S <- list(SIS1 = sis_top(tt, d1), SIS2 = sis_top(tt, d2), SISR = sis_top(tt, dR), RIS = sc$inc,
+            ADJ2 = sis_top(screen_scores(tr, adjust_response(tr, y_tr)), d2), ISIS2 = isis_set(tr, y_tr, d2))
+  f <- function(sel, alpha, pc = FALSE) pen_fit(sel, tr, te, y_tr, y_te, alpha, pc)
+  r1 <- f(S$SIS1, 1); r2 <- f(S$SIS2, 1); r3 <- f(S$SIS2, 0); r4 <- f(S$SISR, 0); r5 <- f(S$RIS, 0)
+  r6 <- f(S$ISIS2, 1); r7 <- f(S$ADJ2, 1, TRUE); r8 <- f(S$ADJ2, 0, TRUE)
+  data.frame(seed = seed_i, baseline = mean((y_te - ym)^2), d1 = d1, dR = dR,
+    SIS_d1_lasso = unname(r1["mspe"]), SIS_2000_lasso = unname(r2["mspe"]), SIS_2000_ridge = unname(r3["mspe"]),
+    SIS_RISsize_ridge = unname(r4["mspe"]), RIS_ridge = unname(r5["mspe"]), ISIS_2000_lasso = unname(r6["mspe"]),
+    SISadj_2000_lasso_pc = unname(r7["mspe"]), SISadj_2000_ridge_pc = unname(r8["mspe"]),
+    nz_SIS_d1_lasso = unname(r1["nz"]), nz_SIS_2000_lasso = unname(r2["nz"]), nz_ISIS_2000_lasso = unname(r6["nz"]),
+    nz_SISadj_2000_lasso_pc = unname(r7["nz"]),
+    GBLUP = mean((y_te - gblup_fit(tr, te, y_tr)$pred)^2))
+}
+sis_res <- run_seeds("sis", run_rep_sis)
+```
+
+```{r sis-plots, fig.height = 6}
+mcols <- c("SIS_d1_lasso", "SIS_2000_lasso", "SIS_2000_ridge", "SIS_RISsize_ridge", "RIS_ridge", "ISIS_2000_lasso",
+           "SISadj_2000_lasso_pc", "SISadj_2000_ridge_pc", "GBLUP")
+mlab <- c("SIS d=120\n+ lasso", "SIS d=2000\n+ lasso", "SIS d=2000\n+ ridge", "SIS (RIS size)\n+ ridge", "RIS (Bernoulli)\n+ ridge",
+          "ISIS d=2000\n+ lasso", "SIS-adj d=2000\n+ lasso + axes", "SIS-adj d=2000\n+ ridge + axes", "GBLUP\n(all SNPs)")
+ok <- sapply(mcols, function(m) any(!is.na(sis_res[[m]])))
+par(mar = c(8, 4, 3, 1))
+boxplot(sis_res[, mcols[ok]], names = mlab[ok], las = 2, cex.axis = 0.7, ylab = "test MSPE",
+        col = c(rep("grey75", sum(ok) - 1), "steelblue"), main = "Screening + penalized regression (FT10, 10 splits)")
+abline(h = mean(si$RP_agg), lty = 2, col = "darkgreen"); text(1, mean(si$RP_agg), "aggregated TARP", col = "darkgreen", pos = 3, cex = 0.7)
+par(mar = c(5, 4, 4, 2))
+dg <- lapply(mcols[ok][-sum(ok)], function(m) sis_res[[m]] - sis_res$GBLUP)
+names(dg) <- mcols[ok][-sum(ok)]
+tab_sis <- data.frame(Method = names(dg),
+  Mean_MSPE = sapply(names(dg), function(m) mean(sis_res[[m]])),
+  R2 = sapply(names(dg), function(m) mean(1 - sis_res[[m]] / sis_res$baseline)),
+  Diff_vs_GBLUP = sapply(dg, mean), SE = sapply(dg, sem), Beats_GBLUP = sapply(dg, function(x) sum(x < 0)))
+knitr::kable(tab_sis, digits = 3, row.names = FALSE, caption = "Paired differences against full-SNP GBLUP (positive = worse than GBLUP)")
+nzt <- data.frame(Model = c("SIS d=120 + lasso", "SIS d=2000 + lasso", "ISIS d=2000 + lasso", "SIS-adj + lasso + axes"),
+                  Mean_nonzero_SNPs = c(mean(sis_res$nz_SIS_d1_lasso), mean(sis_res$nz_SIS_2000_lasso),
+                                         mean(sis_res$nz_ISIS_2000_lasso), mean(sis_res$nz_SISadj_2000_lasso_pc)))
+knitr::kable(nzt, digits = 1, row.names = FALSE, caption = "SNPs retained by the lasso after screening")
+```
+
+## 5.2 What the screens actually select: ancestry tagging, redundancy and LD blocks
+
+Marginal screening ranks SNPs one at a time, so two things can go wrong in genetic data: (i) SNPs that merely **tag
+ancestry** score highly because the phenotype tracks ancestry, and (ii) a single causal locus is represented by
+**many near-duplicate SNPs** in LD, wasting the screening budget. Three diagnostics quantify this for each screen:
+the mean absolute correlation of the selected SNPs with the first ancestry axis, the mean pairwise correlation among
+selected SNPs, and the number of distinct loci (selected SNPs merged when within 50 kb).
+
+```{r sel-diag}
+sel_cache <- file.path("cache", "sel_sets.rds")
+if (USE_CACHE && file.exists(sel_cache)) {
+  sel_sets <- readRDS(sel_cache)
+} else {
+  sel_sets <- lapply(seq_len(N_REPS), function(s) {
+    sp <- make_split(s); tr <- sp$tr; y_tr <- y_all[tr]
+    sc <- screen_set(tr, y_tr); tt <- screen_scores(tr, y_tr)
+    list(SIS_d1 = sis_top(tt, floor(length(tr) / log(length(tr)))), SIS_2000 = sis_top(tt, 2000), RIS = sc$inc,
+         SISadj_2000 = sis_top(screen_scores(tr, adjust_response(tr, y_tr)), 2000))
+  })
+  saveRDS(sel_sets, sel_cache)
+}
+chr_int <- suppressWarnings(as.integer(map$chromosome)); pos_bp <- map$physical.pos
+anc_axis <- as.numeric(scale(pcs5[, 1]))
+sel_metrics <- function(sel) {
+  Xs <- scale(G2[, sel, drop = FALSE]); Xs[is.na(Xs)] <- 0
+  anc <- mean(abs(crossprod(anc_axis, Xs)) / (n - 1))
+  sub <- Xs[, sample(ncol(Xs), min(ncol(Xs), 400)), drop = FALSE]
+  cm <- abs(crossprod(sub)) / (n - 1); redund <- (sum(cm) - ncol(sub)) / (ncol(sub)^2 - ncol(sub))
+  o <- order(chr_int[sel], pos_bp[sel]); ch <- chr_int[sel][o]; ps <- pos_bp[sel][o]
+  loci <- 1 + sum(ch[-1] != ch[-length(ch)] | diff(ps) > 50000, na.rm = TRUE)
+  c(anc_cor = anc, pairwise_cor = redund, loci = loci, size = length(sel))
+}
+set.seed(11)
+diag_df <- do.call(rbind, lapply(seq_along(sel_sets), function(s) do.call(rbind, lapply(names(sel_sets[[s]]), function(m)
+  data.frame(seed = s, set = m, t(sel_metrics(sel_sets[[s]][[m]])))))))
+agg_diag <- aggregate(cbind(anc_cor, pairwise_cor, loci, size) ~ set, data = diag_df, FUN = mean)
+knitr::kable(agg_diag, digits = 3, row.names = FALSE, caption = "Mean over splits")
+rand_anc <- mean(abs(crossprod(anc_axis, {Z <- scale(G2[, sample(p, 2000)]); Z[is.na(Z)] <- 0; Z})) / (n - 1))
+cat(sprintf("Reference: 2,000 random SNPs have mean |correlation| with ancestry axis 1 of %.3f.\n", rand_anc))
+par(mfrow = c(1, 3))
+barplot(setNames(agg_diag$anc_cor, agg_diag$set), las = 2, col = "steelblue", border = NA, cex.names = 0.7,
+        ylab = "mean |cor| with ancestry axis 1", main = "Ancestry tagging")
+abline(h = rand_anc, lty = 2)
+barplot(setNames(agg_diag$pairwise_cor, agg_diag$set), las = 2, col = "darkorange", border = NA, cex.names = 0.7,
+        ylab = "mean pairwise |cor| among selected", main = "Redundancy (LD)")
+barplot(setNames(agg_diag$loci / agg_diag$size, agg_diag$set), las = 2, col = "darkgreen", border = NA, cex.names = 0.7,
+        ylab = "distinct loci per selected SNP", main = "Efficiency of the selected set")
+par(mfrow = c(1, 1))
+```
+
+```{r sel-stability}
+jacc <- function(a, b) length(intersect(a, b)) / length(union(a, b))
+stab <- sapply(names(sel_sets[[1]]), function(m)
+  mean(combn(length(sel_sets), 2, function(ij) jacc(sel_sets[[ij[1]]][[m]], sel_sets[[ij[2]]][[m]]))))
+barplot(stab, col = "steelblue", border = NA, las = 2, cex.names = 0.8, ylab = "mean Jaccard overlap between splits",
+        main = "Stability of the selected set across the 10 splits")
+knitr::kable(data.frame(Screen = names(stab), Mean_Jaccard = round(stab, 3)), row.names = FALSE,
+             caption = "1 = identical sets on every split; each pair of splits shares about 64% of its training accessions")
+```
+
+```{r ld-structure, fig.height = 5}
+# LD decay: mean r^2 against physical distance, from windows on random chromosomes at three SNP strides
+set.seed(77)
+ld_pairs <- do.call(rbind, lapply(c(1, 10, 50), function(stride) do.call(rbind, lapply(1:15, function(i) {
+  ch <- sample(1:5, 1); idx_ch <- which(chr_int == ch)
+  st <- sample(seq_len(length(idx_ch) - 400 * stride), 1); idx <- idx_ch[st + stride * (0:399)]
+  r2 <- suppressWarnings(cor(G2[, idx]))^2; dd <- abs(outer(pos_bp[idx], pos_bp[idx], "-"))
+  ut <- upper.tri(r2); keep <- ut & !is.na(r2)
+  data.frame(dist = dd[keep], r2 = r2[keep])
+}))))
+brk <- c(0, 500, 1e3, 2e3, 5e3, 1e4, 2e4, 5e4, 1e5, 2e5, 5e5)
+ld_pairs$bin <- cut(ld_pairs$dist, brk, include.lowest = TRUE)
+ld_curve <- aggregate(r2 ~ bin, data = ld_pairs, FUN = mean)
+mids <- sqrt(brk[-length(brk)] * pmax(brk[-1], 1)); mids[1] <- 250; names(mids) <- levels(ld_pairs$bin)
+ld_curve$mid <- mids[as.character(ld_curve$bin)]
+par(mfrow = c(1, 2))
+plot(ld_curve$mid / 1000, ld_curve$r2, type = "b", pch = 19, log = "x", xlab = "distance between SNPs (kb, log scale)",
+     ylab = "mean r^2", main = "Linkage disequilibrium decay")
+sel_h <- sort(sel_sets[[1]]$SIS_2000[1:80]); o <- order(chr_int[sel_h], pos_bp[sel_h]); sel_h <- sel_h[o]
+cm <- abs(suppressWarnings(cor(G2[, sel_h]))); cm[is.na(cm)] <- 0
+image(1:80, 1:80, cm[, 80:1], col = hcl.colors(30, "YlOrRd", rev = TRUE), xlab = "top-80 SIS SNPs, in genome order", ylab = "",
+      axes = FALSE, main = "|correlation| among the 80 top SIS SNPs")
+par(mfrow = c(1, 1))
+```
+
+LD decays over tens of kilobases, so SNPs near a causal locus are nearly interchangeable for marginal screening; the
+heatmap shows that the very top SIS picks fall into a few correlated blocks.
+
+```{r manhattan, fig.height = 5}
+# marginal association of every SNP with FT10 on the training rows of split 1; known loci marked approximately
+sp1 <- make_split(1); t1 <- screen_scores(sp1$tr, y_all[sp1$tr]); r1 <- abs(t1)
+ok <- !is.na(chr_int) & chr_int %in% 1:5
+chr_len <- tapply(pos_bp[ok], chr_int[ok], max)
+off <- c(0, cumsum(as.numeric(chr_len))[-length(chr_len)]); names(off) <- names(chr_len)
+xcum <- pos_bp + off[as.character(chr_int)]
+show <- ok & (r1 > quantile(r1[ok], 0.995) | runif(p) < 0.03)
+d1 <- floor(length(sp1$tr) / log(length(sp1$tr)))
+thr1 <- sort(r1, decreasing = TRUE)[d1]; thr2 <- sort(r1, decreasing = TRUE)[2000]
+plot(xcum[show], r1[show], pch = 16, cex = 0.3, col = c("grey40", "steelblue")[chr_int[show] %% 2 + 1],
+     xlab = "genome position (chromosomes 1-5 concatenated)", ylab = "|t-statistic| (training rows)",
+     main = "Marginal association with FT10 and the SIS thresholds")
+abline(h = c(thr1, thr2), lty = c(1, 3), col = "red")
+text(max(xcum[ok]), c(thr1, thr2), c("SIS d=120", "SIS d=2000"), pos = 3, col = "red", cex = 0.7)
+fri <- off["4"] + 270000; flc <- off["5"] + 3176000      # APPROXIMATE TAIR10 positions typed from memory; verify before citing
+abline(v = c(fri, flc), col = "darkgreen", lty = 2); text(c(fri, flc), max(r1[ok]), c("FRI (approx.)", "FLC (approx.)"), pos = 4, col = "darkgreen", cex = 0.7)
+top15 <- order(r1, decreasing = TRUE)[1:15]
+knitr::kable(data.frame(chr = chr_int[top15], pos = pos_bp[top15], abs_t = round(r1[top15], 2),
+   bp_to_FRI = ifelse(chr_int[top15] == 4, abs(pos_bp[top15] - 270000), NA),
+   bp_to_FLC = ifelse(chr_int[top15] == 5, abs(pos_bp[top15] - 3176000), NA)), row.names = FALSE,
+   caption = "Top 15 SNPs by |t| (training rows, split 1); distances use approximate gene positions")
+```
+
+## 5.3 Semi-synthetic simulation: does screening recover the truth, and what do LD and ancestry do to it?
+
+On real data the causal SNPs are unknown. This simulation keeps the **real genotypes** (so the real LD and ancestry
+structure are present) and plants a known signal:
+
+$$y = \underbrace{\textstyle\sum_{j\in S}\beta_j \tilde x_j}_{\text{genetic, variance }h^2_g} + \underbrace{\gamma\,\tilde u_1}_{\text{ancestry, variance }h^2_a} + \varepsilon ,\qquad |S|=s,$$
+
+with $\tilde x_j$ standardized causal SNPs and $\tilde u_1$ the first ancestry axis. Scenarios: **A** sparse (s = 20,
+$h^2_g=0.5$, no ancestry effect); **B** sparse with ancestry confounding (s = 20, $h^2_g=0.3$, $h^2_a=0.4$);
+**C** polygenic (s = 2000, $h^2_g=0.5$). Each screen is run on a training split and scored by
+**exact recovery** (fraction of causal SNPs selected), **locus recovery** (fraction of causal SNPs having a selected SNP
+with $|r|\ge 0.7$, i.e. tagged through LD) and **ancestry tagging** (mean $|r|$ of selected SNPs with axis 1).
+
+```{r sim-run}
+SIM_B <- 12
+sim_scenarios <- list(A_sparse = list(s = 20, h2g = 0.5, h2a = 0), B_sparse_ancestry = list(s = 20, h2g = 0.3, h2a = 0.4),
+                      C_polygenic = list(s = 2000, h2g = 0.5, h2a = 0))
+sim_one <- function(scn_name, b) {
+  scn <- sim_scenarios[[scn_name]]
+  set.seed(5000 + b + 100 * match(scn_name, names(sim_scenarios)))
+  causal <- sample(which(maf >= 0.1), scn$s)
+  Xc <- scale(G2[, causal]); Xc[is.na(Xc)] <- 0
+  g <- as.numeric(Xc %*% rnorm(scn$s)); g <- (g - mean(g)) / sd(g) * sqrt(scn$h2g)
+  a <- anc_axis * sqrt(scn$h2a); e <- rnorm(n) * sqrt(max(1 - scn$h2g - scn$h2a, 0.01))
+  y <- g + a + e
+  sp <- make_split(9000 + b); tr <- sp$tr
+  tt <- screen_scores(tr, y[tr]); r <- sign(tt) * sqrt(tt^2 / (tt^2 + length(tr) - 2))
+  q_in <- abs(r)^max(0, (1 + log(p / length(tr))) / 2); q_in <- q_in / max(q_in)
+  ris <- which(rbinom(p, 1, q_in) == 1)
+  tt_adj <- screen_scores(tr, adjust_response(tr, y[tr]))
+  d1 <- floor(length(tr) / log(length(tr)))
+  sets <- list(SIS_d120 = sis_top(tt, d1), SIS_d2000 = sis_top(tt, 2000), RIS = ris,
+               SISadj_d2000 = sis_top(tt_adj, 2000), Random_d2000 = sample(p, 2000))
+  do.call(rbind, lapply(names(sets), function(m) {
+    sel <- sets[[m]]; Xs <- scale(G2[, sel]); Xs[is.na(Xs)] <- 0
+    cc <- abs(crossprod(Xc, Xs)) / (n - 1)
+    data.frame(scenario = scn_name, rep = b, method = m, exact = mean(causal %in% sel),
+               locus = mean(apply(cc, 1, max) >= 0.7),
+               anc_cor = mean(abs(crossprod(anc_axis, Xs)) / (n - 1)), size = length(sel))
+  }))
+}
+sim_file <- file.path("cache", "sim_results.rds")
+if (USE_CACHE && file.exists(sim_file)) {
+  sim_res <- readRDS(sim_file)
+} else {
+  sim_res <- do.call(rbind, lapply(names(sim_scenarios), function(sn) do.call(rbind, lapply(seq_len(SIM_B), function(b) {
+    cat(sprintf("[simulation] %s replicate %d\n", sn, b)); sim_one(sn, b)}))))
+  saveRDS(sim_res, sim_file)
+}
+```
+
+```{r sim-plots, fig.height = 8}
+sim_res$method <- factor(sim_res$method, levels = c("SIS_d120", "SIS_d2000", "RIS", "SISadj_d2000", "Random_d2000"))
+par(mfrow = c(3, 3), mar = c(6, 4, 3, 1))
+for (sn in names(sim_scenarios)) {
+  d <- sim_res[sim_res$scenario == sn, ]
+  boxplot(exact ~ method, data = d, las = 2, cex.axis = 0.7, ylim = c(0, 1), main = paste(sn, ": exact recovery"), xlab = "", ylab = "fraction of causal SNPs", col = "steelblue")
+  boxplot(locus ~ method, data = d, las = 2, cex.axis = 0.7, ylim = c(0, 1), main = paste(sn, ": locus recovery"), xlab = "", ylab = "fraction tagged (|r| >= 0.7)", col = "darkorange")
+  boxplot(anc_cor ~ method, data = d, las = 2, cex.axis = 0.7, main = paste(sn, ": ancestry tagging"), xlab = "", ylab = "mean |cor| with axis 1", col = "darkgreen")
+}
+par(mfrow = c(1, 1), mar = c(5, 4, 4, 2))
+sim_tab <- aggregate(cbind(exact, locus, anc_cor, size) ~ scenario + method, data = sim_res, FUN = mean)
+knitr::kable(sim_tab, digits = 3, row.names = FALSE, caption = sprintf("Semi-synthetic simulation, mean over %d replicates", SIM_B))
+```
+
+```{r sim-findings, results='asis'}
+g <- function(sn, m, col) sim_tab[[col]][sim_tab$scenario == sn & sim_tab$method == m]
+cat(sprintf("- **Exact recovery is low even in the easy sparse scenario** (SIS d=2000: %.2f of causal SNPs), because correlated neighbours compete for the same budget; **locus recovery** is much higher (%.2f), i.e. screening mostly finds the right *regions*, not the right SNPs.\n",
+            g("A_sparse", "SIS_d2000", "exact"), g("A_sparse", "SIS_d2000", "locus")))
+cat(sprintf("- **Ancestry confounding changes what is selected**: ancestry tagging rises from %.3f (scenario A) to %.3f (scenario B) for SIS d=2000, and falls to %.3f when the response is adjusted for the ancestry axes first (random SNPs: about %.3f). Locus recovery in B: SIS %.2f versus adjusted SIS %.2f.\n",
+            g("A_sparse", "SIS_d2000", "anc_cor"), g("B_sparse_ancestry", "SIS_d2000", "anc_cor"),
+            g("B_sparse_ancestry", "SISadj_d2000", "anc_cor"), g("B_sparse_ancestry", "Random_d2000", "anc_cor"),
+            g("B_sparse_ancestry", "SIS_d2000", "locus"), g("B_sparse_ancestry", "SISadj_d2000", "locus")))
+cat(sprintf("- **Randomized screening (RIS) keeps a large set** (about %.0f SNPs) and recovers loci about as well as hard SIS at that size, while SIS with d = n/log n (%d SNPs) misses many loci: the budget d matters more than the soft-versus-hard rule.\n",
+            g("A_sparse", "RIS", "size"), 120L))
+cat(sprintf("- **Polygenic truth (scenario C)**: no screen recovers more than %.2f of the 2,000 causal loci, which is why dense models beat screened ones for polygenic traits.\n",
+            max(sim_tab$locus[sim_tab$scenario == "C_polygenic" & sim_tab$method != "Random_d2000"])))
+```
+
+```{r sis-findings, results='asis'}
+best <- tab_sis$Method[which.min(tab_sis$Mean_MSPE)]
+cat(sprintf("- **On FT10, SIS plus penalized regression** reaches mean MSPE between %.1f and %.1f depending on the recipe (best: `%s`), against %.1f for aggregated TARP and %.1f for full-SNP GBLUP.\n",
+            min(tab_sis$Mean_MSPE), max(tab_sis$Mean_MSPE), best, mean(si$RP_agg), mean(sis_res$GBLUP)))
+cat(sprintf("- **A hard d = n/log n cut-off is too small here**: SIS d=%d + lasso scores %.1f, versus %.1f for d = 2000 (both with lasso).\n",
+            sis_res$d1[1], mean(sis_res$SIS_d1_lasso), mean(sis_res$SIS_2000_lasso)))
+cat(sprintf("- **Selected sets are strongly ancestry-tagged and redundant**: mean |cor| with ancestry axis 1 is %.3f for SIS d=2000 versus %.3f for random SNPs.\n",
+            agg_diag$anc_cor[agg_diag$set == "SIS_2000"], rand_anc))
+```
+
+
+# 6. The dense baseline, and pitfalls of screen-then-fit pipelines
+
+**GBLUP** (genomic best linear unbiased prediction) is the standard genomic-prediction baseline: ridge regression
+on *all* SNPs, computed through the n x n relationship matrix $K$ as kernel ridge,
+$\hat y_* = K_{*,tr}(K_{tr,tr}+\lambda I)^{-1}y_{tr}$. With no supervised screening, $\lambda$ can be tuned on the
+training data by closed-form leave-one-out CV, $e_i/(1-h_{ii})$ (equivalently, by the closed-form NIG marginal
+likelihood, "evidence"). We also fit a Gaussian-kernel version to check for nonlinearity.
+
+```{r e0-run}
+run_rep_e0 <- function(seed_i) {
+  sp <- make_split(seed_i); tr <- sp$tr; te <- sp$te
+  y_tr <- y_all[tr]; y_te <- y_all[te]; ym <- mean(y_tr); y_c <- y_tr - ym; y_new_c <- y_te - ym
+  K_tt <- Kfull[tr, tr]; K_et <- Kfull[te, tr]
+  lin <- kernel_all(K_tt, K_et, y_c, y_new_c, LAM_GRID)
+  il <- which.min(lin$loo); ie <- which.max(lin$ev)
+  d_tr <- diag(K_tt); d_te <- dK[te]
+  D_tt <- outer(d_tr, d_tr, "+") - 2 * K_tt; D_et <- outer(d_te, d_tr, "+") - 2 * K_et
+  th <- median(D_tt[upper.tri(D_tt)])
+  loo_min <- ev_max <- t_loo <- t_ev <- numeric(length(C_GRID))
+  for (j in seq_along(C_GRID)) {
+    kk <- kernel_all(exp(-pmax(D_tt, 0) / (2 * C_GRID[j] * th)), exp(-pmax(D_et, 0) / (2 * C_GRID[j] * th)),
+                     y_c, y_new_c, LAM_GRID)
+    jl <- which.min(kk$loo); je <- which.max(kk$ev)
+    loo_min[j] <- kk$loo[jl]; ev_max[j] <- kk$ev[je]; t_loo[j] <- kk$test[jl]; t_ev[j] <- kk$test[je]
+  }
+  data.frame(seed = seed_i, baseline = mean((y_te - ym)^2), Lin_loo = lin$test[il], Lin_evid = lin$test[ie],
+             lam_lin_loo = LAM_GRID[il], lam_lin_evid = LAM_GRID[ie],
+             RBF_loo = t_loo[which.min(loo_min)], c_loo = C_GRID[which.min(loo_min)],
+             RBF_evid = t_ev[which.max(ev_max)], c_evid = C_GRID[which.max(ev_max)])
+}
+e0 <- run_seeds("e0", run_rep_e0)
+```
+
+```{r e0-plots, fig.height = 5}
+par(mfrow = c(1, 3))
+rng <- range(c(si$RP_agg, e0$Lin_loo))
+plot(e0$Lin_loo, si$RP_agg, pch = 19, xlim = rng, ylim = rng, xlab = "full-SNP GBLUP test MSPE", ylab = "aggregated TARP test MSPE",
+     main = "Each point = one split"); abline(0, 1, lty = 2)
+plot(e0$Lin_loo, e0$RBF_loo, pch = 19, xlab = "GBLUP (linear kernel)", ylab = "Gaussian kernel", main = "Linear vs Gaussian kernel, no screening")
+abline(0, 1, lty = 2)
+barplot(table(factor(e0$c_loo, levels = C_GRID)), col = "steelblue", border = NA, xlab = "bandwidth multiplier chosen by LOOCV",
+        ylab = "splits", main = "Nonlinearity preference (16 = linear limit)")
+par(mfrow = c(1, 1))
+dd <- si$RP_agg - e0$Lin_loo
+cat(sprintf("GBLUP: mean MSPE %.1f (R2 %.3f). Aggregated TARP: %.1f. GBLUP better by %.1f (SE %.1f) in %d of %d splits. Gaussian minus linear kernel without screening: %.2f (SE %.2f).\n",
+            mean(e0$Lin_loo), mean(1 - e0$Lin_loo / e0$baseline), mean(si$RP_agg), mean(dd), sem(dd), sum(dd > 0), nrow(e0),
+            mean(e0$RBF_loo - e0$Lin_loo), sem(e0$RBF_loo - e0$Lin_loo)))
+```
+
+## 6.1 Pitfall 1: leakage of test labels into screening
+
+Screening uses the response, so it must see **training rows only**. Using all rows (a one-argument slip) lets the test
+labels choose the predictors. The block below repeats RIS-PCR with that slip.
+
+```{r leak-run}
+run_rep_leak <- function(seed_i) {
+  sp <- make_split(seed_i); tr <- sp$tr; te <- sp$te
+  y_tr <- y_all[tr]; y_te <- y_all[te]; y_mean <- mean(y_tr); y_c <- y_tr - y_mean
+  tt <- screen_scores(seq_len(n), y_all)                        # LEAK: all rows, test labels included
+  r <- sign(tt) * sqrt(tt^2 / (tt^2 + n - 2)); q_in <- abs(r)^max(0, (1 + log(p / n)) / 2); q_in <- q_in / max(q_in)
+  inc <- which(rbinom(p, 1, q_in) == 1)
+  X <- std_cols(G2[, inc], tr, te)
+  V <- prcomp(X$tr, center = FALSE, scale. = FALSE, rank. = K_DIM)$rotation[, 1:K_DIM]
+  data.frame(seed = seed_i, PCA_leaky = nig_mspe(X$tr %*% V, X$other %*% V, y_c, y_mean, y_te), n_screened = length(inc))
+}
+leak <- run_seeds("leak", run_rep_leak)
+par(mfrow = c(1, 2))
+boxplot(list("screening on training rows\n(correct)" = si$PCA, "screening on all rows\n(leaky)" = leak$PCA_leaky),
+        ylab = "test MSPE of RIS-PCR", col = c("steelblue", "firebrick"), main = "Leakage flatters the screened model")
+barplot(c(correct = mean(1 - si$PCA / si$baseline), leaky = mean(1 - leak$PCA_leaky / si$baseline)), col = c("steelblue", "firebrick"),
+        border = NA, ylab = "test R-squared", main = "Apparent versus honest R-squared")
+par(mfrow = c(1, 1))
+cat(sprintf("RIS-PCR test MSPE %.1f with correct screening versus %.1f when the test labels leak into screening (%.0f%% lower, R-squared %.3f versus %.3f).\n",
+            mean(si$PCA), mean(leak$PCA_leaky), 100 * (1 - mean(leak$PCA_leaky) / mean(si$PCA)),
+            mean(1 - si$PCA / si$baseline), mean(1 - leak$PCA_leaky / si$baseline)))
+```
+
+## 6.2 Pitfall 2: tuning on the same data that screening has already used
+
+If the SNPs were chosen because they correlate with the *training* response, any criterion computed afterwards on
+the same samples (leave-one-out CV, evidence, an inner CV that does not repeat the screening) is over-confident
+about the screened SNPs and picks too little regularization. The correct protocol is **nested**: inside each inner
+fold, repeat the whole pipeline (screen, standardize, fit) on that fold's training rows and score on its held-out
+rows. The comparison below uses the same screened SNPs and the same final model (ridge on a linear kernel) with
+three tuning rules, plus the unscreened GBLUP where the in-sample rules are valid.
+
+```{r e1-helpers}
+pca_ridge <- function(Z_tr, Z_te, y_c, y_mean, y_te, lam_grid) {   # ridge on orthogonal PCA scores, evidence-tuned
+  n_ <- length(y_c); d <- colSums(Z_tr^2); zy <- as.numeric(crossprod(Z_tr, y_c))
+  ytil2 <- zy^2 / d; rest <- max(sum(y_c^2) - sum(ytil2), 0)
+  ev <- vapply(lam_grid, function(l) log_evidence(d / l, ytil2, rest, n_), numeric(1)); i <- which.max(ev)
+  pred_at <- function(l) as.numeric(Z_te %*% (zy / (d + l))) + y_mean
+  list(mspe_fixed = mean((y_te - pred_at(1))^2), mspe_evid = mean((y_te - pred_at(lam_grid[i]))^2), lam = lam_grid[i])
+}
+kernel_set <- function(X_tr, X_o, c_grid) {                      # linear and Gaussian kernels from one Gram computation
+  p_g <- ncol(X_tr); Gtr <- tcrossprod(X_tr); Go <- tcrossprod(X_o, X_tr)
+  rn_tr <- diag(Gtr); rn_o <- rowSums(X_o^2)
+  D_tr <- outer(rn_tr, rn_tr, "+") - 2 * Gtr; D_o <- outer(rn_o, rn_tr, "+") - 2 * Go
+  th <- median(D_tr[upper.tri(D_tr)])
+  list(lin = list(K = Gtr / p_g, Ko = Go / p_g),
+       rbf = lapply(c_grid, function(cc) list(K = exp(-pmax(D_tr, 0) / (2 * cc * th)), Ko = exp(-pmax(D_o, 0) / (2 * cc * th)))))
+}
+curves_for <- function(ks, y_c, y_new_c, lam_grid) {
+  list(lin = mse_curve(kernel_curve(ks$lin$K, ks$lin$Ko, y_c, lam_grid), y_new_c),
+       rbf = t(vapply(ks$rbf, function(k) mse_curve(kernel_curve(k$K, k$Ko, y_c, lam_grid), y_new_c), numeric(length(lam_grid)))))
+}
+```
+
+```{r e1-run}
+# (a) in-sample tuning on the screened data: PCA ridge by evidence, linear-kernel ridge by evidence and by LOOCV
+run_rep_e1 <- function(seed_i) {
+  sp <- make_split(seed_i); tr <- sp$tr; te <- sp$te
+  y_tr <- y_all[tr]; y_te <- y_all[te]; y_mean <- mean(y_tr); y_c <- y_tr - y_mean
+  sc <- screen_set(tr, y_tr); X <- std_cols(G2[, sc$inc], tr, te); X_tr <- X$tr; X_te <- X$other; p_g <- ncol(X_tr)
+  V <- prcomp(X_tr, center = FALSE, scale. = FALSE, rank. = K_DIM)$rotation[, 1:K_DIM]
+  pr <- pca_ridge(X_tr %*% V, X_te %*% V, y_c, y_mean, y_te, LAM_GRID)
+  lin <- kernel_all(tcrossprod(X_tr) / p_g, tcrossprod(X_te, X_tr) / p_g, y_c, y_te - y_mean, LAM_GRID)
+  il <- which.min(lin$loo); ie <- which.max(lin$ev)
+  data.frame(seed = seed_i, n_screened = p_g, PCA_fixed = pr$mspe_fixed, PCA_evid = pr$mspe_evid, lam_PCA = pr$lam,
+             Lin_evid = lin$test[ie], Lin_loo = lin$test[il], lam_lin_evid = LAM_GRID[ie], lam_lin_loo = LAM_GRID[il])
+}
+e1 <- run_seeds("e1", run_rep_e1, legacy = "exp1_results.rds")
+
+# (b) honest tuning: nested CV with the screening repeated inside every inner fold
+run_rep_e1b <- function(seed_i) {
+  sp <- make_split(seed_i); tr <- sp$tr; te <- sp$te
+  y_tr <- y_all[tr]; y_te <- y_all[te]; y_mean <- mean(y_tr)
+  sc0 <- screen_set(tr, y_tr); sc <- std_cols(G2[, sc0$inc], tr, te)
+  set.seed(seed_i * 1000 + 7)
+  fold <- sample(rep(seq_len(K_IN), length.out = length(tr)))
+  cv_lin <- matrix(0, K_IN, length(LAM_GRID)); cv_rbf <- array(0, c(K_IN, length(C_GRID), length(LAM_GRID)))
+  for (f in seq_len(K_IN)) {
+    in_tr <- tr[fold != f]; in_va <- tr[fold == f]; y_in <- y_all[in_tr]; ym <- mean(y_in)
+    sf0 <- screen_set(in_tr, y_in); sf <- std_cols(G2[, sf0$inc], in_tr, in_va)         # re-screen INSIDE the fold
+    cv <- curves_for(kernel_set(sf$tr, sf$other, C_GRID), y_in - ym, y_all[in_va] - ym, LAM_GRID)
+    cv_lin[f, ] <- cv$lin; cv_rbf[f, , ] <- cv$rbf
+  }
+  cvl <- colMeans(cv_lin); il <- which.min(cvl)
+  cvr <- apply(cv_rbf, c(2, 3), mean); ib <- arrayInd(which.min(cvr), dim(cvr)); jc <- ib[1, 1]; jl <- ib[1, 2]
+  te_cv <- curves_for(kernel_set(sc$tr, sc$other, C_GRID), y_tr - y_mean, y_te - y_mean, LAM_GRID)
+  data.frame(seed = seed_i, n_screened = ncol(sc$tr), Lin_honest = te_cv$lin[il], RBF_honest = te_cv$rbf[jc, jl],
+             Lin_oracle = min(te_cv$lin), RBF_oracle = min(te_cv$rbf),
+             lam_lin = LAM_GRID[il], lam_rbf = LAM_GRID[jl], c_sel = C_GRID[jc], cv_lin_min = min(cvl), cv_rbf_min = min(cvr))
+}
+e1b <- run_seeds("e1b", run_rep_e1b, legacy = "exp1b_results.rds")
+```
+
+```{r e1-plots, fig.height = 5}
+par(mfrow = c(1, 2), mar = c(8, 4, 3, 1))
+lam_list <- list("screened data\nLOOCV" = log10(e1$lam_lin_loo), "screened data\nevidence" = log10(e1$lam_lin_evid),
+                 "screened data\nnested CV" = log10(e1b$lam_lin), "all SNPs\nLOOCV" = log10(e0$lam_lin_loo),
+                 "all SNPs\nevidence" = log10(e0$lam_lin_evid))
+boxplot(lam_list, las = 2, cex.axis = 0.75, ylab = "log10(lambda) chosen", col = c(rep("firebrick", 2), "steelblue", rep("grey70", 2)),
+        main = "Regularization chosen by each tuning rule")
+abline(h = log10(LAM_GRID[1]), lty = 3)
+mse_list <- list("screened\nLOOCV" = e1$Lin_loo, "screened\nevidence" = e1$Lin_evid, "screened\nnested CV" = e1b$Lin_honest,
+                 "all SNPs\nLOOCV (GBLUP)" = e0$Lin_loo, "TARP\naggregated" = si$RP_agg)
+boxplot(mse_list, las = 2, cex.axis = 0.75, ylab = "test MSPE", col = c(rep("firebrick", 2), "steelblue", "grey70", "darkgreen"),
+        main = "Test error by tuning rule (same screened SNPs)")
+par(mfrow = c(1, 1), mar = c(5, 4, 4, 2))
+pit <- data.frame(Procedure = c("TARP, one projection", "TARP, aggregated (paper)", "Screened ridge, LOOCV on screened data",
+                                "Screened ridge, evidence on screened data", "Screened ridge, nested CV (re-screening)",
+                                "Full-SNP ridge, LOOCV (no screening)", "Full-SNP ridge, evidence (no screening)"),
+                  Mean_MSPE = c(mean(si$RP_single), mean(si$RP_agg), mean(e1$Lin_loo), mean(e1$Lin_evid), mean(e1b$Lin_honest),
+                                mean(e0$Lin_loo), mean(e0$Lin_evid)),
+                  Median_log10_lambda = c(NA, NA, median(log10(e1$lam_lin_loo)), median(log10(e1$lam_lin_evid)),
+                                          median(log10(e1b$lam_lin)), median(log10(e0$lam_lin_loo)), median(log10(e0$lam_lin_evid))))
+knitr::kable(pit, digits = 2, row.names = FALSE, caption = "Pitfalls in one table (FT10 test MSPE)")
+```
+
+The in-sample criteria choose a far smaller $\lambda$ than nested CV (LOOCV runs into the bottom of the grid) and give
+the worst test error; nested CV fixes it. With no screening, LOOCV and evidence agree and give the same error: this
+is a natural experiment confirming that the screening step, not the criterion, causes the bias. The paper's own
+design (a $\delta$ formula, an $m_n$ range, averaging) avoids data-driven tuning after screening altogether.
+
+# 7. Does screening add anything to a dense kernel? Targeted GBLUP
+
+Screening is good at finding large-effect SNPs, which a dense ridge dilutes. **Targeted GBLUP** keeps the dense kernel
+and adds TARP's own screened set as a second kernel, $K = K_{full} + w\,K_{screened}$: screened SNPs receive a
+prior-variance boost of about $1 + w\,p/p_{screened}$. $w=0$ is GBLUP; large $w$ approaches the screened-only ridge.
+$(w,\lambda)$ are chosen by nested CV with re-screening inside each fold.
+
+```{r e3-run}
+run_rep_e3 <- function(seed_i) {
+  sp <- make_split(seed_i); tr <- sp$tr; te <- sp$te
+  y_tr <- y_all[tr]; y_te <- y_all[te]; y_mean <- mean(y_tr)
+  sc <- screen_set(tr, y_tr); Ks_all <- screened_gram(sc$inc)
+  set.seed(seed_i * 1000 + 7)
+  fold <- sample(rep(seq_len(K_IN), length.out = length(tr)))
+  cv <- array(0, c(K_IN, length(W_GRID), length(LAM_GRID)))
+  for (f in seq_len(K_IN)) {
+    in_tr <- tr[fold != f]; in_va <- tr[fold == f]; y_in <- y_all[in_tr]; ym <- mean(y_in)
+    Ks_f <- screened_gram(screen_set(in_tr, y_in)$inc)                           # re-screen inside the fold
+    for (iw in seq_along(W_GRID)) {
+      w <- W_GRID[iw]
+      cv[f, iw, ] <- mse_curve(kernel_curve(Kfull[in_tr, in_tr] + w * Ks_f[in_tr, in_tr],
+                                             Kfull[in_va, in_tr] + w * Ks_f[in_va, in_tr], y_in - ym, LAM_GRID),
+                               y_all[in_va] - ym)
+    }
+  }
+  cvm <- apply(cv, c(2, 3), mean); jl_w <- apply(cvm, 1, which.min)
+  best <- arrayInd(which.min(cvm), dim(cvm)); iw_star <- best[1, 1]; il_star <- best[1, 2]
+  te_m <- t(vapply(seq_along(W_GRID), function(iw) {
+    w <- W_GRID[iw]
+    mse_curve(kernel_curve(Kfull[tr, tr] + w * Ks_all[tr, tr], Kfull[te, tr] + w * Ks_all[te, tr], y_tr - y_mean, LAM_GRID),
+              y_te - y_mean)
+  }, numeric(length(LAM_GRID))))
+  out <- data.frame(seed = seed_i, n_screened = length(sc$inc), TwoK_honest = te_m[iw_star, il_star],
+                    GBLUP_nested = te_m[1, jl_w[1]], TwoK_oracle = min(te_m), w_sel = W_GRID[iw_star],
+                    lam_sel = LAM_GRID[il_star], cv_min = min(cvm))
+  for (iw in seq_along(W_GRID)) out[[paste0("T_w", W_GRID[iw])]] <- te_m[iw, jl_w[iw]]
+  out
+}
+e3 <- run_seeds("e3", run_rep_e3, legacy = "exp3_results.rds")
+```
+
+```{r e3-plots, fig.height = 5}
+wcols <- paste0("T_w", W_GRID)
+mu_w <- sapply(wcols, function(cn) mean(e3[[cn]])); dmat <- sapply(wcols, function(cn) e3[[cn]] - e3$T_w0)
+par(mfrow = c(1, 2))
+plot(seq_along(W_GRID), mu_w, type = "b", pch = 19, xaxt = "n", xlab = "w (weight on the screened kernel)", ylab = "mean test MSPE",
+     main = "Targeted GBLUP: error against w")
+axis(1, at = seq_along(W_GRID), labels = W_GRID)
+abline(h = mean(e1b$Lin_honest), lty = 3, col = "firebrick"); abline(h = mean(si$RP_agg), lty = 3, col = "darkgreen")
+legend("topright", c("screened-only ridge", "aggregated TARP"), col = c("firebrick", "darkgreen"), lty = 3, bty = "n", cex = 0.8)
+boxplot(list("targeted GBLUP\n- GBLUP" = e3$TwoK_honest - e3$GBLUP_nested, "targeted GBLUP\n- GBLUP (oracle w)" = e3$TwoK_oracle - e3$GBLUP_nested),
+        ylab = "MSPE difference", col = "steelblue", main = "Paired difference over 10 splits"); abline(h = 0, lty = 2)
+par(mfrow = c(1, 1))
+d3 <- e3$TwoK_honest - e3$GBLUP_nested
+cat(sprintf("Targeted GBLUP minus GBLUP (both nested-tuned): %.2f (SE %.2f), better in %d of %d splits; w chosen: %s. Peeking at the test set (oracle) would gain %.1f.\n",
+            mean(d3), sem(d3), sum(d3 < 0), nrow(e3), paste(names(table(e3$w_sel)), table(e3$w_sel), sep = "x", collapse = ", "),
+            mean(e3$GBLUP_nested - e3$TwoK_oracle)))
+```
+
+# 8. Structure-aware group screening
+
+The project's central structural idea is to screen **groups** of correlated SNPs instead of single SNPs (the GSIS
+statistic of Agarwal, Dutta and Mukhopadhyay for grouped covariates): score a group by the joint explanatory power
+of all its members, $\|P(X_{(k)})y\|^2/p_k$, then keep groups with probability proportional to a power of that score.
+Groups should reflect LD. As a practical proxy for LD blocks, SNPs among the 50,000 strongest marginal candidates are
+**clustered by their loadings in a PCA/correspondence-analysis embedding** (for strictly binary genotypes this
+embedding is the same as the standardized-PCA one), giving about 500 groups of about 100 SNPs. Only the GSIS
+*screening statistic* is implemented here, not the full reversible-jump search of the grouped-covariate paper.
+Two details matter: the group exponent $\delta_g=\max\{0,(1+\log(n_g/n))/2\}$ collapses to zero, i.e. no screening at
+all, if too few groups are formed (an earlier version of this analysis clustered only the 8,718 RIS survivors into 87
+groups and silently reproduced RIS-PCR exactly), and the group set must be capped in size to fit in memory.
+
+```{r group-run}
+run_rep_group <- function(seed_i) {
+  sp <- make_split(seed_i); tr <- sp$tr; te <- sp$te
+  y_tr <- y_all[tr]; y_te <- y_all[te]; y_mean <- mean(y_tr); y_c <- y_tr - y_mean
+  sc <- screen_set(tr, y_tr); r <- sc$r
+  X <- std_cols(G2[, sc$inc], tr, te); X_tr <- X$tr; X_te <- X$other; p_g <- ncol(X_tr)
+  Om <- tarp_omega(p_g, K_DIM); RIS_random <- nig_mspe(X_tr %*% Om, X_te %*% Om, y_c, y_mean, y_te)
+  V <- prcomp(X_tr, center = FALSE, scale. = FALSE, rank. = K_DIM)$rotation[, 1:K_DIM]
+  RIS_PCA <- nig_mspe(X_tr %*% V, X_te %*% V, y_c, y_mean, y_te)
+  K_CAND <- 50000
+  cand <- order(abs(r), decreasing = TRUE)[1:K_CAND]
+  Xc <- std_cols(G2[, cand], tr, te)
+  emb <- prcomp(Xc$tr, center = FALSE, scale. = FALSE, rank. = 30)$rotation[, 1:30]
+  km <- kmeans(emb, centers = round(K_CAND / 100), iter.max = 50, nstart = 5)
+  group_list <- split(seq_len(K_CAND), km$cluster); n_groups <- length(group_list)
+  gsis_one <- function(cols_local) {
+    cols <- cand[cols_local]
+    Xk <- scale(G2[tr, cols, drop = FALSE], center = TRUE, scale = FALSE)
+    beta <- tryCatch(solve(crossprod(Xk) + diag(1, ncol(Xk)), crossprod(Xk, y_c)), error = function(e) rep(0, ncol(Xk)))
+    sum((Xk %*% beta)^2) / length(cols)
+  }
+  gq <- unlist(mclapply(group_list, gsis_one, mc.cores = N_CORES))
+  delta_g <- max(0, (1 + log(n_groups / length(tr))) / 2); q_g <- (gq / max(gq))^delta_g
+  inc_g <- cand[unlist(group_list[rbinom(n_groups, 1, q_g) == 1])]
+  max_cols <- floor(1.5e9 / (n * 8))                                            # memory guard
+  if (length(inc_g) > max_cols) {
+    sc_snp <- numeric(p); for (k in which(q_g > 0)) sc_snp[cand[group_list[[k]]]] <- gq[k]
+    inc_g <- inc_g[order(sc_snp[inc_g], decreasing = TRUE)[seq_len(max_cols)]]
+  }
+  Xg <- std_cols(G2[, inc_g], tr, te)
+  Og <- tarp_omega(ncol(Xg$tr), K_DIM); GSIS_random <- nig_mspe(Xg$tr %*% Og, Xg$other %*% Og, y_c, y_mean, y_te)
+  Vg <- prcomp(Xg$tr, center = FALSE, scale. = FALSE, rank. = K_DIM)$rotation[, 1:K_DIM]
+  GSIS_PCA <- nig_mspe(Xg$tr %*% Vg, Xg$other %*% Vg, y_c, y_mean, y_te)
+  data.frame(seed = seed_i, baseline = mean((y_te - y_mean)^2), RIS_random = RIS_random, RIS_PCA = RIS_PCA,
+             GSIS_random = GSIS_random, GSIS_PCA = GSIS_PCA, n_groups = n_groups, delta_g = delta_g)
+}
+grp_res <- run_seeds("group", run_rep_group, legacy = "replication_results.rds")
+```
+
+```{r group-plots, fig.height = 5}
+cells <- c("RIS_random", "RIS_PCA", "GSIS_random", "GSIS_PCA")
+par(mfrow = c(1, 2))
+boxplot(grp_res[, cells], names = c("RIS\nrandom proj.", "RIS\nPCA", "group screen\nrandom proj.", "group screen\nPCA"),
+        col = c("grey70", "steelblue", "grey70", "steelblue"), ylab = "test MSPE", main = "Individual versus group screening")
+dgp <- list("group - individual\n(random proj.)" = grp_res$GSIS_random - grp_res$RIS_random,
+            "group - individual\n(PCA)" = grp_res$GSIS_PCA - grp_res$RIS_PCA,
+            "PCA - random proj.\n(individual)" = grp_res$RIS_PCA - grp_res$RIS_random)
+boxplot(dgp, ylab = "MSPE difference", col = "darkorange", main = "Paired differences"); abline(h = 0, lty = 2)
+par(mfrow = c(1, 1))
+knitr::kable(data.frame(Contrast = names(dgp), Mean = sapply(dgp, mean), SE = sapply(dgp, sem), Negative_in = sapply(dgp, function(x) sum(x < 0))),
+             digits = 2, row.names = FALSE, caption = "Group-level screening and projection choice (random projection here is a single, unaggregated draw)")
+cat(sprintf("Groups formed per split: %.0f (delta_g = %.2f, non-degenerate). Group screening with random projection: %.1f versus individual screening %.1f; with PCA: %.1f versus %.1f.\n",
+            mean(grp_res$n_groups), mean(grp_res$delta_g), mean(grp_res$GSIS_random), mean(grp_res$RIS_random),
+            mean(grp_res$GSIS_PCA), mean(grp_res$RIS_PCA)))
+```
+
+Group screening does not reliably beat individual screening: with a single random projection the two are
+indistinguishable (the group version is noisier), and with PCA projection the individual rule is at least as good.
+The one large, stable effect is the choice of projection (PCA against a single random draw), which the paper's
+aggregation step removes (Section 4).
+
+
+# 9. What is being predicted? Population structure, relatedness and within-lineage signal
+
+Flowering time varies along the main ancestry gradient (Section 3.1), so part of any genome-wide predictor is
+"which lineage is this accession from". Three analyses separate this from genuine within-lineage signal.
+
+## 9.1 Latent class analysis (LCA) of the genotypes, fitted by EM
+
+A latent class model for binary genotypes (a Bernoulli mixture) is fitted by the EM algorithm on a thinned, evenly
+spaced panel of 800 SNPs with minor allele frequency at least 0.1: each accession gets soft class memberships
+$R$ ($n\times K$), with class-specific allele probabilities $\theta_{kj}$ and mixing weights $\pi_k$. No response is used.
+Neighbouring SNPs are not independent given the class, so BIC favors many classes; the classes are flexible ancestry
+features, not a taxonomy.
+
+```{r lca}
+lca_em <- function(B, K, n_init = 10, iters = 300, tol = 1e-7) {
+  n_ <- nrow(B); best <- NULL
+  for (s in seq_len(n_init)) {
+    R <- matrix(runif(n_ * K), n_, K); R <- R / rowSums(R); ll_old <- -Inf
+    for (it in seq_len(iters)) {
+      pi_k <- pmax(colMeans(R), 1e-8)                                              # M-step
+      theta <- sweep(t(R) %*% B + 0.5, 1, colSums(R) + 1, "/")
+      logp <- B %*% t(log(theta)) + (1 - B) %*% t(log(1 - theta))                  # E-step
+      logp <- sweep(logp, 2, log(pi_k), "+")
+      m <- apply(logp, 1, max); lse <- m + log(rowSums(exp(logp - m)))
+      R <- exp(logp - lse); ll <- sum(lse)
+      if (abs(ll - ll_old) < tol * abs(ll)) break
+      ll_old <- ll
+    }
+    if (is.null(best) || ll > best$ll) best <- list(R = R, ll = ll)
+  }
+  best
+}
+set.seed(2025)
+Xp <- G2[, round(seq(1, p, length.out = 30000))]; f_l <- colMeans(Xp) / 2
+Xp <- Xp[, f_l > 0.1 & f_l < 0.9]
+B_lca <- (Xp[, round(seq(1, ncol(Xp), length.out = min(800, ncol(Xp))))] >= 1) * 1; rm(Xp)
+K_LCA_SET <- c(2:8, 10, 12, 16, 20, 24)
+lca_file <- file.path("cache", "lca_fits.rds")
+if (USE_CACHE && file.exists(lca_file)) {
+  fits <- readRDS(lca_file)
+} else {
+  fits <- lapply(K_LCA_SET, function(k) lca_em(B_lca, k)); names(fits) <- K_LCA_SET; saveRDS(fits, lca_file)
+}
+bic <- sapply(names(fits), function(k) { k <- as.integer(k); -2 * fits[[as.character(k)]]$ll + ((k - 1) + k * ncol(B_lca)) * log(n) })
+Rmem8 <- fits[["8"]]$R; hard8 <- max.col(Rmem8)
+cat("Class sizes at K = 8:", paste(table(hard8), collapse = " / "), "\nMean FT10 by class:", paste(round(tapply(y_all, hard8, mean), 1), collapse = " / "), "\n")
+```
+
+```{r lca-plots, fig.height = 5}
+par(mfrow = c(1, 3))
+plot(as.integer(names(bic)), bic, type = "b", pch = 19, xlab = "latent classes K", ylab = "BIC", main = "LCA: BIC by K")
+pal <- rainbow(8, v = 0.85)
+plot(pcs5[, 1], pcs5[, 2], pch = 16, cex = 0.6, col = pal[hard8], xlab = "axis 1", ylab = "axis 2", main = "LCA classes (K = 8) on the genomic axes")
+barplot(tapply(y_all, hard8, mean), col = pal, border = NA, xlab = "latent class", ylab = "mean FT10 (days)", main = "Flowering time by class")
+par(mfrow = c(1, 1))
+```
+
+## 9.2 Relatedness-only predictors, ancestry-explicit GBLUP and within-lineage correlation
+
+Predictors that use **only relatedness** (no SNP effects): the mean FT10 of the k genetically closest training
+accessions (kNN on the genomic distance), a Nadaraya-Watson kernel smoother on the same distances, and LCA class
+memberships. They are compared with GBLUP, and with ancestry-explicit GBLUP ("Q+K": the dense kernel plus a linear
+kernel on the LCA memberships or the top-5 axes, weight chosen by LOOCV). Finally, the **within-class correlation**:
+test accessions and their predictions are centered within their latent class, and the pooled correlation is computed.
+A predictor that only knows lineage scores about zero.
+
+```{r struct-run}
+K_NN_GRID <- c(1, 2, 3, 5, 8, 12, 20, 30, 50, 80); H_GRID <- c(0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1)
+WQ_GRID <- c(0, 0.1, 0.3, 1, 3, 10, 30, 100); K_WITHIN <- c(4, 6, 8, 12)
+knn_predict <- function(D_tt, D_te, y_tr, k_grid) {
+  n_tr <- length(y_tr); kmax <- max(k_grid); Dt <- D_tt; diag(Dt) <- Inf
+  loo <- matrix(0, n_tr, length(k_grid))
+  for (i in seq_len(n_tr)) { nn <- order(Dt[i, ])[1:kmax]; loo[i, ] <- (cumsum(y_tr[nn]) / seq_len(kmax))[k_grid] }
+  kbest <- k_grid[which.min(colMeans((y_tr - loo)^2))]
+  list(pred = vapply(seq_len(nrow(D_te)), function(i) mean(y_tr[order(D_te[i, ])[1:kbest]]), numeric(1)), k = kbest)
+}
+nw_apply <- function(D, y_tr, h, th, drop_self = FALSE) {
+  W <- exp(-pmax(D, 0) / (2 * h * th)); if (drop_self) diag(W) <- 0
+  den <- rowSums(W); num <- as.numeric(W %*% y_tr); ifelse(den < 1e-8, mean(y_tr), num / pmax(den, 1e-300))
+}
+nw_predict <- function(D_tt, D_te, y_tr, h_grid) {
+  th <- median(D_tt[upper.tri(D_tt)])
+  mse <- sapply(h_grid, function(h) mean((y_tr - nw_apply(D_tt, y_tr, h, th, TRUE))^2)); hb <- h_grid[which.min(mse)]
+  list(pred = nw_apply(D_te, y_tr, hb, th), h = hb)
+}
+within_cor <- function(y, pr, g, min_n = 5) {
+  tb <- table(g); keep <- as.integer(names(tb)[tb >= min_n]); ix <- g %in% keep
+  yc <- y[ix] - ave(y[ix], g[ix]); pc <- pr[ix] - ave(pr[ix], g[ix])
+  c(r = cor(yc, pc), slope = sum(yc * pc) / sum(pc^2), n = sum(ix), frac = sum(yc^2) / sum((y - mean(y))^2))
+}
+lin_kernel <- function(M) { Kq <- tcrossprod(scale(M, center = TRUE, scale = FALSE)); Kq / mean(diag(Kq)) }
+qk_fit <- function(Kq, tr, te, y_c, y_new_c) {
+  res <- lapply(WQ_GRID, function(w) kernel_all(Kfull[tr, tr] + w * Kq[tr, tr], Kfull[te, tr] + w * Kq[te, tr], y_c, y_new_c, LAM_GRID))
+  loo <- sapply(res, function(r) r$loo); ib <- arrayInd(which.min(loo), dim(loo))
+  list(mspe = res[[ib[1, 2]]]$test[ib[1, 1]], w = WQ_GRID[ib[1, 2]])
+}
+K_lca_kernel <- lin_kernel(Rmem8[, -ncol(Rmem8), drop = FALSE]); K_pc_kernel <- lin_kernel(pcs5)
+hard_k <- lapply(K_WITHIN, function(k) max.col(fits[[as.character(k)]]$R)); names(hard_k) <- K_WITHIN
+
+run_rep_struct <- function(seed_i) {
+  sp <- make_split(seed_i); tr <- sp$tr; te <- sp$te
+  y_tr <- y_all[tr]; y_te <- y_all[te]; ym <- mean(y_tr); y_c <- y_tr - ym; y_new_c <- y_te - ym
+  X1 <- cbind(1, Rmem8[, -ncol(Rmem8), drop = FALSE])                       # class-membership-only predictor
+  beta <- solve(crossprod(X1[tr, ]) + 1e-6 * diag(ncol(X1)), crossprod(X1[tr, ], y_tr))
+  qk_l <- qk_fit(K_lca_kernel, tr, te, y_c, y_new_c); qk_p <- qk_fit(K_pc_kernel, tr, te, y_c, y_new_c)
+  D_tt <- gdist(tr, tr); D_te <- gdist(te, tr)
+  kn <- knn_predict(D_tt, D_te, y_tr, K_NN_GRID); nw <- nw_predict(D_tt, D_te, y_tr, H_GRID); gb <- gblup_fit(tr, te, y_tr)
+  out <- data.frame(seed = seed_i, baseline = mean((y_te - ym)^2), class_only = mean((y_te - X1[te, ] %*% beta)^2),
+                    GBLUP = mean((y_te - gb$pred)^2), QK_LCA = qk_l$mspe, w_LCA = qk_l$w, QK_PC = qk_p$mspe, w_PC = qk_p$w,
+                    kNN = mean((y_te - kn$pred)^2), k_sel = kn$k, NW = mean((y_te - nw$pred)^2), h_sel = nw$h)
+  for (k in K_WITHIN) {
+    g_te <- hard_k[[as.character(k)]][te]; wg <- within_cor(y_te, gb$pred, g_te); wk <- within_cor(y_te, kn$pred, g_te)
+    out[[paste0("wcG_", k)]] <- unname(wg["r"]); out[[paste0("wcK_", k)]] <- unname(wk["r"]); out[[paste0("wfrac_", k)]] <- unname(wg["frac"])
+  }
+  out
+}
+struct <- run_seeds("struct", run_rep_struct)
+```
+
+```{r struct-plots, fig.height = 5.5}
+base_m <- mean(struct$baseline); gb_m <- mean(struct$GBLUP)
+class_only_sweep <- function(Rk) {                       # class-only predictor for any LCA fit, over the same splits
+  mean(sapply(seq_len(N_REPS), function(s) {
+    sp <- make_split(s); X <- cbind(1, Rk[, -ncol(Rk), drop = FALSE])
+    b <- solve(crossprod(X[sp$tr, ]) + 1e-6 * diag(ncol(X)), crossprod(X[sp$tr, ], y_all[sp$tr]))
+    mean((y_all[sp$te] - X[sp$te, ] %*% b)^2)
+  }))
+}
+sweep_k <- data.frame(K = as.integer(names(fits)), class_only = sapply(fits, function(f) class_only_sweep(f$R)))
+sweep_k$share <- (base_m - sweep_k$class_only) / (base_m - gb_m)
+par(mfrow = c(1, 3))
+r2m <- c("kNN" = mean(1 - struct$kNN / struct$baseline), "Nadaraya-\nWatson" = mean(1 - struct$NW / struct$baseline),
+         "LCA classes\n(K=8)" = mean(1 - struct$class_only / struct$baseline), "GBLUP" = mean(1 - struct$GBLUP / struct$baseline))
+barplot(r2m, col = c("grey70", "grey70", "grey70", "steelblue"), border = NA, ylab = "test R-squared", main = "Relatedness only versus GBLUP")
+plot(sweep_k$K, sweep_k$share, type = "b", pch = 19, ylim = c(0, 1.05), xlab = "LCA classes K", ylab = "share of GBLUP's improvement",
+     main = "Ancestry-only predictor against resolution"); abline(h = 1, lty = 3)
+abline(h = (base_m - mean(struct$kNN)) / (base_m - gb_m), col = "firebrick", lty = 2)
+abline(h = (base_m - mean(struct$NW)) / (base_m - gb_m), col = "darkgreen", lty = 2)
+legend("bottomright", c("LCA class-only", "kNN", "Nadaraya-Watson"), col = c("black", "firebrick", "darkgreen"), lty = c(1, 2, 2), bty = "n", cex = 0.8)
+dq <- list("Q+K (LCA)" = struct$QK_LCA - struct$GBLUP, "Q+K (axes)" = struct$QK_PC - struct$GBLUP)
+boxplot(dq, ylab = "MSPE minus GBLUP", col = "darkorange", main = "Explicit ancestry component"); abline(h = 0, lty = 2)
+par(mfrow = c(1, 1))
+knitr::kable(sweep_k, digits = 3, row.names = FALSE, caption = "Class-membership-only predictor: test MSPE and share of GBLUP's improvement over the mean-only predictor")
+```
+
+```{r within-plots, fig.height = 5}
+wtab <- do.call(rbind, lapply(K_WITHIN, function(k) data.frame(K = k,
+  GBLUP_r = mean(struct[[paste0("wcG_", k)]]), GBLUP_SE = sem(struct[[paste0("wcG_", k)]]),
+  kNN_r = mean(struct[[paste0("wcK_", k)]]), kNN_SE = sem(struct[[paste0("wcK_", k)]]),
+  within_share_of_variance = mean(struct[[paste0("wfrac_", k)]]))))
+wtab$GBLUP_explains_of_total <- wtab$GBLUP_r^2 * wtab$within_share_of_variance
+knitr::kable(wtab, digits = 3, row.names = FALSE, caption = "Within-class correlation of predictions with FT10")
+par(mfrow = c(1, 2))
+plot(wtab$K, wtab$GBLUP_r, type = "b", pch = 19, ylim = c(0, 1), xlab = "latent classes K", ylab = "within-class correlation with FT10",
+     main = "Is there signal beyond lineage?")
+lines(wtab$K, wtab$kNN_r, type = "b", pch = 17, col = "firebrick"); abline(h = 0, lty = 2)
+legend("bottomleft", c("GBLUP", "nearest relatives (kNN)"), col = c("black", "firebrick"), pch = c(19, 17), lty = 1, bty = "n", cex = 0.8)
+sp1 <- make_split(1); gb1 <- gblup_fit(sp1$tr, sp1$te, y_all[sp1$tr])
+plot(y_all[sp1$te], gb1$pred, pch = 16, col = pal[hard8[sp1$te]], xlab = "observed FT10", ylab = "GBLUP prediction",
+     main = sprintf("Split 1: observed vs predicted (R2 = %.2f)", 1 - mean((y_all[sp1$te] - gb1$pred)^2) / mean((y_all[sp1$te] - mean(y_all[sp1$tr]))^2)))
+abline(0, 1, lty = 2)
+par(mfrow = c(1, 1))
+```
+
+```{r struct-findings, results='asis'}
+cat(sprintf("- **Relatedness alone is not enough**: R-squared is %.3f for the nearest-relatives smoother, %.3f for the LCA memberships (K = 8) and %.3f for GBLUP; the relatedness-only predictors reach roughly %.0f%%-%.0f%% of GBLUP's improvement over the mean-only predictor and plateau there as the number of classes grows.\n",
+            r2m[2], r2m[3], r2m[4], 100 * min(sweep_k$share[sweep_k$K >= 8]), 100 * max(sweep_k$share[sweep_k$K >= 8])))
+cat(sprintf("- **There is strong within-lineage signal**: the within-class correlation of GBLUP predictions with FT10 is %.2f at K = 8 and still %.2f at K = 12 (nearest-relatives predictor: %.2f and %.2f).\n",
+            wtab$GBLUP_r[wtab$K == 8], wtab$GBLUP_r[wtab$K == 12], wtab$kNN_r[wtab$K == 8], wtab$kNN_r[wtab$K == 12]))
+cat(sprintf("- **Explicit ancestry adds nothing to GBLUP**: mean MSPE difference %.2f (LCA memberships) and %.2f (top-5 axes); the dominant axis of the genomic kernel is already left almost unpenalized by the ridge.\n",
+            mean(dq[[1]]), mean(dq[[2]])))
+```
+
+Relatedness and ancestry explain a large share of the predictable signal, but GBLUP predicts *within* lineages too, so
+comparisons between SNP-level methods are comparisons on genuine genome-wide signal. Part of that within-lineage
+signal is fine-scale relatedness (the nearest-relatives predictor also has within-class skill); since GBLUP is itself a
+kernel smoother, fine-scale relatedness and additive SNP effects cannot be separated further with these data.
+Two further structure-based ideas (a fixed-gating mixture of experts and a shared-plus-class-interaction kernel) were
+tried during development and gave no gain (the mixture of experts was clearly worse and unstable); they are not
+reproduced here.
+
+# 10. Calibration of prediction intervals
+
+TARP's NIG posterior yields a Student-t predictive distribution, $y_*\sim t_{n+2a}\!\big(z_*'\mu,\; s^2(1+z_*'Wz_*)\big)$.
+Its coverage on new accessions is checked against **split-conformal** alternatives around GBLUP, which carry a
+distribution-free finite-sample guarantee. A–D are fitted on 75% of the training rows (the rest calibrate); E–F use
+all training rows and no calibration set. All target 90% coverage.
+
+| Key | Interval |
+|---|---|
+| A | GBLUP + split conformal, absolute residuals |
+| B | GBLUP as a kernel-NIG model: Student-t predictive interval |
+| C | GBLUP + conformal on residuals normalized by the GP predictive sd |
+| D | like A, calibrated separately within each of three ancestry clusters (Mondrian) |
+| E | TARP-style: screening + PCA + NIG interval |
+| F | TARP-style: screening + one random projection + NIG interval |
+
+```{r e2-helpers}
+conf_q <- function(scores, alpha) { m <- length(scores); k <- ceiling((m + 1) * (1 - alpha)); if (k > m) Inf else sort(scores)[k] }
+interval_metrics <- function(lo, hi, y, g, alpha) {
+  hit <- (y >= lo) & (y <= hi)
+  isc <- (hi - lo) + (2 / alpha) * pmax(lo - y, 0) + (2 / alpha) * pmax(y - hi, 0)            # Winkler interval score
+  gcov <- sapply(seq_len(K_GROUPS), function(k) if (any(g == k)) mean(hit[g == k]) else NA_real_)
+  list(cov = mean(hit), wid = mean(hi - lo), iscore = mean(isc), gcov = gcov, mincov = min(gcov, na.rm = TRUE))
+}
+gp_fit <- function(K_tt, y_c, lam_grid, a = 0.01, b = 0.01) {
+  n_ <- length(y_c); eg <- eigen(K_tt, symmetric = TRUE); e <- pmax(eg$values, 0); U <- eg$vectors
+  yt <- as.numeric(crossprod(U, y_c)); S <- outer(e, lam_grid, function(ei, li) ei / (ei + li))
+  loo <- colMeans(((y_c - U %*% (S * yt)) / pmax(1 - (U^2) %*% S, 1e-8))^2); lam <- lam_grid[which.min(loo)]
+  list(e = e, U = U, yt = yt, lam = lam, s2 = (2 * b + sum(yt^2 / (1 + e / lam))) / (n_ + 2 * a), df = n_ + 2 * a)
+}
+gp_predict <- function(fit, K_new, k_diag) {
+  KU <- K_new %*% fit$U
+  list(mean_c = as.numeric(KU %*% (fit$yt / (fit$e + fit$lam))),
+       v = pmax(k_diag - rowSums(sweep(KU^2, 2, fit$e + fit$lam, "/")), 0))
+}
+nig_interval <- function(Z_tr, Z_te, yc, ym, alpha, a = 0.01, b = 0.01) {         # the paper's predictive distribution
+  n_ <- length(yc); m <- ncol(Z_tr); A <- diag(m) + crossprod(Z_tr); mu <- solve(A, crossprod(Z_tr, yc))
+  s2 <- (sum(yc^2) - as.numeric(crossprod(mu, A %*% mu)) + 2 * b) / (n_ + 2 * a)
+  vfac <- 1 + colSums(t(Z_te) * solve(A, t(Z_te)))
+  half <- qt(1 - alpha / 2, n_ + 2 * a) * sqrt(s2 * vfac); mid <- as.numeric(Z_te %*% mu) + ym
+  list(lo = mid - half, hi = mid + half)
+}
+```
+
+```{r e2-run}
+run_rep_e2 <- function(seed_i) {
+  sp <- make_split(seed_i); tr <- sp$tr; te <- sp$te
+  y_te <- y_all[te]; g_te <- grp[te]; y_tr <- y_all[tr]; ym <- mean(y_tr); yc <- y_tr - ym
+  sc <- screen_set(tr, y_tr); X <- std_cols(G2[, sc$inc], tr, te); X_tr <- X$tr; X_te <- X$other
+  pca <- prcomp(X_tr, center = FALSE, scale. = FALSE, rank. = 100)
+  iv_E <- nig_interval(X_tr %*% pca$rotation, X_te %*% pca$rotation, yc, ym, ALPHA)
+  set.seed(seed_i * 1000 + 13); Om <- tarp_omega(ncol(X_tr), 100)
+  iv_F <- nig_interval(X_tr %*% Om, X_te %*% Om, yc, ym, ALPHA)
+  set.seed(seed_i * 1000 + 11)
+  cal_pos <- sample(seq_along(tr), size = round(0.25 * length(tr))); cal <- tr[cal_pos]; pt <- tr[-cal_pos]
+  y_pt <- y_all[pt]; ym_pt <- mean(y_pt); y_cal <- y_all[cal]
+  fit <- gp_fit(Kfull[pt, pt], y_pt - ym_pt, LAM_GRID)
+  pc <- gp_predict(fit, Kfull[cal, pt, drop = FALSE], dK[cal]); pe <- gp_predict(fit, Kfull[te, pt, drop = FALSE], dK[te])
+  mu_cal <- pc$mean_c + ym_pt; mu_te <- pe$mean_c + ym_pt; res_cal <- abs(y_cal - mu_cal)
+  sdf_cal <- sqrt(1 + pc$v / fit$lam); sdf_te <- sqrt(1 + pe$v / fit$lam)
+  qA <- conf_q(res_cal, ALPHA); half_B <- qt(1 - ALPHA / 2, fit$df) * sqrt(fit$s2) * sdf_te
+  qC <- conf_q(res_cal / sdf_cal, ALPHA); g_cal <- grp[cal]
+  qD <- sapply(seq_len(K_GROUPS), function(k) { s <- res_cal[g_cal == k]; if (length(s) >= MIN_G) conf_q(s, ALPHA) else qA })
+  ints <- list(A_conformal = list(lo = mu_te - qA, hi = mu_te + qA), B_bayes_t = list(lo = mu_te - half_B, hi = mu_te + half_B),
+               C_gp_conformal = list(lo = mu_te - qC * sdf_te, hi = mu_te + qC * sdf_te),
+               D_mondrian = list(lo = mu_te - qD[g_te], hi = mu_te + qD[g_te]), E_TARP_PCA_NIG = iv_E, F_TARP_RP_NIG = iv_F)
+  out <- data.frame(seed = seed_i, mspe_GBLUP75 = mean((y_te - mu_te)^2))
+  for (nm in names(ints)) {
+    mm <- interval_metrics(ints[[nm]]$lo, ints[[nm]]$hi, y_te, g_te, ALPHA)
+    out[[paste0("cov_", nm)]] <- mm$cov; out[[paste0("wid_", nm)]] <- mm$wid; out[[paste0("isc_", nm)]] <- mm$iscore
+    out[[paste0("mincov_", nm)]] <- mm$mincov
+    for (k in seq_len(K_GROUPS)) out[[paste0("gcov_", nm, "_g", k)]] <- mm$gcov[k]
+  }
+  out
+}
+e2 <- run_seeds("e2", run_rep_e2, legacy = "exp2_results.rds")
+```
+
+```{r e2-plots, fig.height = 6}
+nms <- c("A_conformal", "B_bayes_t", "C_gp_conformal", "D_mondrian", "E_TARP_PCA_NIG", "F_TARP_RP_NIG")
+lab <- c("A conformal", "B Bayes t", "C GP-normalized\nconformal", "D Mondrian", "E TARP PCA\nNIG", "F TARP RP\nNIG")
+isG <- c(rep("steelblue", 4), rep("firebrick", 2))
+cm <- sapply(nms, function(m) e2[[paste0("cov_", m)]]); mm <- sapply(nms, function(m) e2[[paste0("mincov_", m)]])
+par(mfrow = c(2, 2), mar = c(7, 4, 3, 1))
+boxplot(cm, names = lab, las = 2, cex.axis = 0.7, col = isG, ylab = "test coverage", main = "Coverage of nominal 90% intervals"); abline(h = 0.9, lty = 2)
+boxplot(mm, names = lab, las = 2, cex.axis = 0.7, col = isG, ylab = "coverage in the worst ancestry cluster", main = "Worst-cluster coverage"); abline(h = 0.9, lty = 2)
+wd <- sapply(nms, function(m) mean(e2[[paste0("wid_", m)]])); cv <- colMeans(cm)
+plot(wd, cv, pch = 19, col = isG, cex = 1.5, xlab = "mean interval width (days)", ylab = "mean coverage", main = "Coverage against width")
+text(wd, cv, c("A", "B", "C", "D", "E", "F"), pos = 3); abline(h = 0.9, lty = 2)
+gt <- sapply(seq_len(K_GROUPS), function(k) sapply(nms, function(m) mean(e2[[paste0("gcov_", m, "_g", k)]], na.rm = TRUE)))
+matplot(t(gt), type = "b", pch = 1:6, lty = 1, col = c(rep("steelblue", 4), rep("firebrick", 2)), xaxt = "n", ylab = "coverage",
+        main = "Coverage within each ancestry cluster"); axis(1, at = seq_len(K_GROUPS), labels = paste("cluster", seq_len(K_GROUPS))); abline(h = 0.9, lty = 2)
+par(mfrow = c(1, 1), mar = c(5, 4, 4, 2))
+cal_tab <- data.frame(Interval = gsub("\n", " ", lab), Coverage = colMeans(cm), Seed_SD = apply(cm, 2, sd),
+                      Mean_width = wd, Interval_score = sapply(nms, function(m) mean(e2[[paste0("isc_", m)]])),
+                      Worst_cluster_coverage = colMeans(mm))
+knitr::kable(cal_tab, digits = 3, row.names = FALSE, caption = "Test-set coverage, width and interval score (lower is better)")
+colnames(gt) <- paste0("cluster ", seq_len(K_GROUPS), " (", as.integer(table(grp)), " accessions)"); rownames(gt) <- gsub("\n", " ", lab)
+knitr::kable(gt, digits = 3, caption = "Mean coverage within each ancestry cluster")
+```
+
+Intervals that rely on screened SNPs under-cover: screening has already used the training response, so the residual
+variance is under-estimated. Intervals around the dense GBLUP model, with a calibration set that no screening step has
+touched, reach the nominal level; the Bayesian t-interval from the kernel model is already close to calibrated. The
+paper's statement that random-projection intervals cover better than PCA ones points the same way here
+(F above E) but the difference is within noise. Each split has only 201 test accessions, so coverage per split is
+uncertain by about 0.02.
+
+# 11. A second trait (FT16), and a place for a third
+
+```{r trait-fn}
+run_rep_trait <- function(seed_i, y_full, pool, run_tarp = TRUE) {
+  sp <- make_split(seed_i, pool); tr <- sp$tr; te <- sp$te
+  y_tr <- y_full[tr]; y_te <- y_full[te]; ym <- mean(y_tr); y_c <- y_tr - ym; y_new_c <- y_te - ym
+  base <- mean((y_te - ym)^2)
+  sc <- screen_set(tr, y_tr); Ks_all <- screened_gram(sc$inc)
+  g <- kernel_all(Kfull[tr, tr], Kfull[te, tr], y_c, y_new_c, LAM_GRID); GBLUP <- g$test[which.min(g$loo)]
+  set.seed(seed_i * 1000 + 7)
+  fold <- sample(rep(seq_len(K_IN), length.out = length(tr)))
+  cvw <- array(0, c(K_IN, length(W_GRID), length(LAM_GRID))); cvs <- matrix(0, K_IN, length(LAM_GRID))
+  for (f in seq_len(K_IN)) {
+    in_tr <- tr[fold != f]; in_va <- tr[fold == f]; y_in <- y_full[in_tr]; ymf <- mean(y_in); yv <- y_full[in_va] - ymf
+    Ks_f <- screened_gram(screen_set(in_tr, y_in)$inc)
+    for (iw in seq_along(W_GRID)) {
+      wv <- W_GRID[iw]
+      cvw[f, iw, ] <- mse_curve(kernel_curve(Kfull[in_tr, in_tr] + wv * Ks_f[in_tr, in_tr], Kfull[in_va, in_tr] + wv * Ks_f[in_va, in_tr],
+                                              y_in - ymf, LAM_GRID), yv)
+    }
+    cvs[f, ] <- mse_curve(kernel_curve(Ks_f[in_tr, in_tr], Ks_f[in_va, in_tr], y_in - ymf, LAM_GRID), yv)
+  }
+  cvm <- apply(cvw, c(2, 3), mean); ib <- arrayInd(which.min(cvm), dim(cvm)); iw_s <- ib[1, 1]; il_s <- ib[1, 2]
+  ils <- which.min(colMeans(cvs)); w_s <- W_GRID[iw_s]
+  TGB <- mse_curve(kernel_curve(Kfull[tr, tr] + w_s * Ks_all[tr, tr], Kfull[te, tr] + w_s * Ks_all[te, tr], y_c, LAM_GRID), y_new_c)[il_s]
+  SCR <- mse_curve(kernel_curve(Ks_all[tr, tr], Ks_all[te, tr], y_c, LAM_GRID), y_new_c)[ils]
+  AGG <- NA_real_
+  if (run_tarp) {
+    X <- std_cols(G2[, sc$inc], tr, te); set.seed(seed_i * 1000 + 17)
+    AGG <- mean((y_te - agg_tarp_pred(X$tr, X$other, y_c, ym, p))^2)
+  }
+  data.frame(seed = seed_i, n_pool = length(pool), baseline = base, GBLUP = GBLUP, TGB = TGB, SCR = SCR, AGG = AGG, w_sel = w_s)
+}
+pool16 <- which(!is.na(y16)); cat("FT16: accessions with genotype and phenotype:", length(pool16), "\n")
+t16 <- run_seeds("trait_FT16", function(s) run_rep_trait(s, y16, pool16), legacy = "trait_FT16_results.rds")
+traits <- list(FT10 = NULL, FT16 = t16)
+if (!is.null(THIRD_TRAIT$file)) {                        # optional third trait: set THIRD_TRAIT in the parameters chunk
+  d3 <- read.csv(THIRD_TRAIT$file)
+  y3 <- as.numeric(d3[[THIRD_TRAIT$y_col]][match(as.character(fam$sample.ID), as.character(d3[[THIRD_TRAIT$id_col]]))])
+  pool3 <- which(!is.na(y3)); cat(THIRD_TRAIT$name, ": accessions with genotype and phenotype:", length(pool3), "\n")
+  stopifnot(length(pool3) >= 200)
+  traits[[THIRD_TRAIT$name]] <- run_seeds(paste0("trait_", gsub("[^A-Za-z0-9]", "_", THIRD_TRAIT$name)),
+                                          function(s) run_rep_trait(s, y3, pool3))
+}
+traits$FT10 <- data.frame(seed = e3$seed, baseline = si$baseline[match(e3$seed, si$seed)], GBLUP = e0$Lin_loo[match(e3$seed, e0$seed)],
+                          TGB = e3$TwoK_honest, SCR = e1b$Lin_honest[match(e3$seed, e1b$seed)], AGG = si$RP_agg[match(e3$seed, si$seed)])
+```
+
+```{r trait-plots, fig.height = 5}
+tr_rows <- do.call(rbind, lapply(names(traits), function(nm) {
+  df <- traits[[nm]]; ms <- c("GBLUP", "TGB", "SCR", "AGG")
+  data.frame(Trait = nm, Method = ms, Mean_MSPE = sapply(ms, function(m) mean(df[[m]], na.rm = TRUE)),
+             R2 = sapply(ms, function(m) mean(1 - df[[m]] / df$baseline, na.rm = TRUE)),
+             Diff_vs_GBLUP = sapply(ms, function(m) mean(df[[m]] - df$GBLUP, na.rm = TRUE)),
+             SE = sapply(ms, function(m) sem((df[[m]] - df$GBLUP)[!is.na(df[[m]])])),
+             Beats_GBLUP = sapply(ms, function(m) sum(df[[m]] < df$GBLUP, na.rm = TRUE)),
+             Pct_of_GBLUP_MSPE = sapply(ms, function(m) 100 * mean(df[[m]] - df$GBLUP, na.rm = TRUE) / mean(df$GBLUP)))
+}))
+rownames(tr_rows) <- NULL
+knitr::kable(tr_rows, digits = 3, caption = "GBLUP = full SNP; TGB = targeted GBLUP; SCR = honest screened ridge; AGG = aggregated TARP. Last column: difference as % of GBLUP's MSPE")
+par(mfrow = c(1, length(traits)))
+for (nm in names(traits)) {
+  df <- traits[[nm]]; d <- sapply(c("TGB", "SCR", "AGG"), function(m) 100 * (df[[m]] - df$GBLUP) / df$GBLUP)
+  boxplot(d, col = "steelblue", ylab = "% difference in MSPE vs GBLUP", main = nm); abline(h = 0, lty = 2)
+}
+par(mfrow = c(1, 1))
+```
+
+FT16 is the same accessions at another temperature and is strongly correlated with FT10, so agreement between the two
+shows the result is not an artifact of the 10 degree measurement, not that it holds for traits with a different
+genetic architecture. The key test of **when screening helps** is a trait dominated by a few large-effect loci
+(for example a DOG1-related germination trait, available from the Dryad repository of Martinez-Berdeja et al. 2020 and
+AraPheno): download it, convert to CSV, set `THIRD_TRAIT <- list(file = "...csv", id_col = "...", y_col = "...", name = "DOG1 germination")`
+in the parameters chunk and re-render. The chunk above then runs the same four methods on it and adds it to the table.
+If screening is going to beat a dense kernel anywhere, it should be there.
+
+
+# 12. Synthesis
+
+## 12.1 Every method on one scale (FT10)
+
+```{r synthesis-data, fig.height = 7.5}
+named <- function(df, col) if (!is.null(df) && col %in% names(df)) setNames(df[[col]], df$seed) else NULL
+cands <- list(
+  "Nearest-relatives smoother (kNN, genomic kernel)" = named(struct, "kNN"),
+  "Nadaraya-Watson on genomic kernel" = named(struct, "NW"),
+  "LCA class memberships only (K = 8)" = named(struct, "class_only"),
+  "TARP, single random projection" = named(si, "RP_single"),
+  "SIS d = 120 + lasso" = named(sis_res, "SIS_d1_lasso"),
+  "SIS d = 2000 + lasso" = named(sis_res, "SIS_2000_lasso"),
+  "SIS d = 2000 + ridge" = named(sis_res, "SIS_2000_ridge"),
+  "ISIS d = 2000 + lasso" = named(sis_res, "ISIS_2000_lasso"),
+  "Structure-adjusted SIS + lasso + axes" = named(sis_res, "SISadj_2000_lasso_pc"),
+  "Group screening + random projection" = named(grp_res, "GSIS_random"),
+  "Group screening + PCA" = named(grp_res, "GSIS_PCA"),
+  "PCA on RIS-screened SNPs (RIS-PCR)" = named(si, "PCA"),
+  "TARP, aggregated (100 draws)" = named(si, "RP_agg"),
+  "Randomized SVD (q = 2) on RIS-screened SNPs" = named(si, "SI_q2"),
+  "Screened-SNP ridge, honest tuning" = named(e1b, "Lin_honest"),
+  "Screened-SNP Gaussian kernel, honest tuning" = named(e1b, "RBF_honest"),
+  "Targeted GBLUP (dense + screened kernel)" = named(e3, "TwoK_honest"),
+  "GBLUP (all SNPs)" = named(e0, "Lin_loo"))
+cands <- cands[!sapply(cands, is.null)]
+cands <- lapply(cands, function(v) v[!is.na(v)]); cands <- cands[sapply(cands, length) > 0]
+gbn <- named(e0, "Lin_loo")
+r2s <- lapply(cands, function(v) 1 - v / base_s[names(v)])
+mu <- sapply(r2s, mean); se <- sapply(r2s, sem); o <- order(mu)
+par(mar = c(4, 19, 3, 1))
+bp <- barplot(mu[o], horiz = TRUE, las = 1, cex.names = 0.75, border = NA, xlim = c(0, max(mu + 2 * se) * 1.08),
+              col = ifelse(grepl("GBLUP", names(mu)[o]), "steelblue", ifelse(grepl("SIS|Group", names(mu)[o]), "darkorange",
+                     ifelse(grepl("TARP|PCA|Randomized", names(mu)[o]), "darkgreen", "grey70"))),
+              xlab = "test R-squared (mean over 10 splits; bars = +-2 SE)", main = "Predictive R-squared by method, FT10")
+arrows(mu[o] - 2 * se[o], bp, mu[o] + 2 * se[o], bp, angle = 90, code = 3, length = 0.03)
+legend("bottomright", c("dense kernel", "screening (SIS family, groups)", "TARP and projections", "relatedness only"),
+       fill = c("steelblue", "darkorange", "darkgreen", "grey70"), bty = "n", cex = 0.8)
+par(mar = c(5, 4, 4, 2))
+ms <- setdiff(names(cands), "GBLUP (all SNPs)")
+dd <- lapply(ms, function(m) cands[[m]] - gbn[names(cands[[m]])]); names(dd) <- ms
+tab_all <- data.frame(Method = names(mu), R2 = mu, R2_SE = se, Mean_MSPE = sapply(cands, mean))
+tab_all$Diff_vs_GBLUP <- c(sapply(names(mu), function(m) if (m %in% ms) mean(dd[[m]]) else 0))
+tab_all$SE_diff <- c(sapply(names(mu), function(m) if (m %in% ms) sem(dd[[m]]) else 0))
+tab_all$Beats_GBLUP <- c(sapply(names(mu), function(m) if (m %in% ms) sum(dd[[m]] < 0) else NA))
+tab_all <- tab_all[order(-tab_all$R2), ]; rownames(tab_all) <- NULL
+knitr::kable(tab_all, digits = 3, caption = "Mean over the ten splits; the mean-only predictor has R-squared 0 by construction; negative difference = better than GBLUP")
+```
+
+```{r forest, fig.height = 6.5}
+md <- sapply(dd, mean); sd_ <- sapply(dd, sem); o <- order(md)
+par(mar = c(4, 19, 3, 1))
+plot(md[o], seq_along(o), pch = 19, yaxt = "n", ylab = "", xlim = range(c(md - 2 * sd_, md + 2 * sd_, 0)),
+     xlab = "MSPE minus GBLUP MSPE (positive = worse than GBLUP; +-2 SE)", main = "Every method against full-SNP GBLUP")
+segments(md[o] - 2 * sd_[o], seq_along(o), md[o] + 2 * sd_[o], seq_along(o))
+axis(2, at = seq_along(o), labels = names(md)[o], las = 1, cex.axis = 0.7); abline(v = 0, lty = 2)
+par(mar = c(5, 4, 4, 2))
+```
+
+The ten splits reuse the same accessions, so these standard errors describe split-to-split variation only and are
+optimistic; read the ordering and the size of the gaps, not the nominal significance.
+
+## 12.2 Key findings (computed from the results above)
+
+```{r key-findings, results='asis'}
+R2 <- function(v) mean(1 - v / base_s[names(v)])
+gm <- gbn
+a <- named(si, "RP_agg"); dga <- a - gm[names(a)]
+cat(sprintf("1. **TARP claims reproduced.** One random projection: MSPE %.1f; 100-draw aggregation: %.1f; exact PCA: %.1f; mean-only: %.1f. Aggregated TARP matches PCA (difference %.1f, SE %.1f).\n",
+            mean(si$RP_single), mean(si$RP_agg), mean(si$PCA), mean(si$baseline), mean(si$RP_agg - si$PCA), sem(si$RP_agg - si$PCA)))
+cat(sprintf("2. **Dense baseline wins.** Full-SNP GBLUP R-squared %.3f versus aggregated TARP %.3f; GBLUP better by %.1f MSPE (SE %.1f), in %d of %d splits.\n",
+            R2(gm), R2(a), mean(dga), sem(dga), sum(dga > 0), length(dga)))
+cat(sprintf("3. **SIS family.** Best SIS-based recipe: `%s` (R-squared %.3f); hard SIS with d = n/log n is too small here (%.3f). Structure-adjusted SIS plus ancestry axes: %.3f.\n",
+            names(which.max(sapply(r2s[grepl("SIS", names(r2s))], mean))), max(sapply(r2s[grepl("SIS", names(r2s))], mean)),
+            if ("SIS d = 120 + lasso" %in% names(r2s)) mean(r2s[["SIS d = 120 + lasso"]]) else NA,
+            if ("Structure-adjusted SIS + lasso + axes" %in% names(r2s)) mean(r2s[["Structure-adjusted SIS + lasso + axes"]]) else NA))
+cat(sprintf("4. **Pitfalls.** Test labels in screening make RIS-PCR look %.0f%% better than it is; tuning after screening picks median log10(lambda) %.1f (LOOCV) versus %.2f (nested CV) and %.1f without screening.\n",
+            100 * (1 - mean(leak$PCA_leaky) / mean(si$PCA)), median(log10(e1$lam_lin_loo)), median(log10(e1b$lam_lin)), median(log10(e0$lam_lin_loo))))
+cat(sprintf("5. **Structure.** Relatedness-only predictors reach R-squared %.3f (nearest relatives) and %.3f (LCA classes, K = 8) against %.3f for GBLUP; GBLUP's within-class correlation is %.2f at K = 8.\n",
+            R2(named(struct, "NW")), R2(named(struct, "class_only")), R2(gm), wtab$GBLUP_r[wtab$K == 8]))
+cat(sprintf("6. **Targeted GBLUP** minus GBLUP: %.2f (SE %.2f); group screening versus individual screening with PCA: %.2f (SE %.2f). Neither adds detectable accuracy on FT10.\n",
+            mean(e3$TwoK_honest - e3$GBLUP_nested), sem(e3$TwoK_honest - e3$GBLUP_nested),
+            mean(grp_res$GSIS_PCA - grp_res$RIS_PCA), sem(grp_res$GSIS_PCA - grp_res$RIS_PCA)))
+cat(sprintf("7. **Intervals.** Nominal 90%% coverage: TARP-style %.3f (PCA) and %.3f (random projection); GBLUP split-conformal %.3f; Mondrian-by-ancestry worst-cluster coverage %.3f.\n",
+            mean(e2$cov_E_TARP_PCA_NIG), mean(e2$cov_F_TARP_RP_NIG), mean(e2$cov_A_conformal), mean(e2$mincov_D_mondrian)))
+f16 <- tr_rows[tr_rows$Trait == "FT16", ]
+cat(sprintf("8. **Second trait (FT16).** Same ordering: as a percentage of GBLUP's MSPE, targeted GBLUP %.1f%%, honest screened ridge %+.1f%%, aggregated TARP %+.1f%%.\n",
+            f16$Pct_of_GBLUP_MSPE[f16$Method == "TGB"], f16$Pct_of_GBLUP_MSPE[f16$Method == "SCR"], f16$Pct_of_GBLUP_MSPE[f16$Method == "AGG"]))
+```
+
+## 12.3 What can and cannot be claimed
+
+**Supported by these experiments**
+
+- TARP's aggregation requirement, and the rough equivalence of aggregated TARP and PCA projection, are reproduced on a
+  real dataset with p of about 1.7 million.
+- Classical SIS, randomized SIS, iterated SIS and structure-adjusted SIS were implemented and compared. Screening
+  recovers loci, not individual SNPs (LD), is pulled toward ancestry-tagging SNPs when ancestry drives the phenotype, and
+  that pull is reduced by adjusting for ancestry before screening (simulation, Section 5.3).
+- On FT10 and FT16, full-SNP GBLUP is at least as accurate as every screening-based method tried; targeted GBLUP is
+  statistically tied with it.
+- Leakage and tuning after supervised screening are biased and nested tuning fixes it; intervals built after screening
+  under-cover; conformal intervals around GBLUP are calibrated.
+- GBLUP predicts within lineages, not only between them.
+
+**Not supported, do not claim**
+
+- A new method that beats GBLUP or TARP.
+- Nonlinearity or epistasis (the Gaussian-kernel edge appeared only after screening and vanished without it).
+- That random-projection intervals cover better than PCA intervals (within noise).
+- Novelty for conformal prediction, Mondrian calibration, ancestry-explicit models, latent-class mixtures or mixture
+  priors: all are established, so their role here is application and quantification.
+- That group screening helps (it did not, with this LD proxy).
+- Generality beyond flowering time until a trait with a different genetic architecture has been run.
+
+# 13. Discussion
+
+**Replication.** The mechanics of TARP (soft screening, sparse random projection, closed-form NIG fit, aggregation) work as
+described. A single projection is not a usable estimator; the paper's aggregation is essential, and with it the method
+matches PCA projection. Randomized SVD with TARP's own sketch is a cheaper way to the same accuracy than 100
+aggregated projections, though not cheaper than exact PCA through the Gram matrix when n is small.
+
+**Screening and variable selection.** Marginal screening ranks SNPs one at a time. In genetic data this has three
+consequences, each measured here: strong LD means one causal locus is represented by many near-duplicate SNPs, so the
+selected set is large but covers few loci and exact recovery is poor while locus recovery is good; ancestry that drives
+the phenotype makes ancestry-tagging SNPs rank highly, and screening the ancestry-adjusted response removes that pull;
+and a hard cut-off of n/log n is far too small for a trait with many contributing loci. The soft, randomized rule of
+TARP keeps a much larger set and loses little relative to hard SIS of the same size, so the budget matters more than the
+randomization.
+
+**Does structure help?** In two different senses. For *variable selection*, adjusting for ancestry before screening
+changes what is selected in the intended direction. For *prediction*, the useful structure is the genome-wide similarity
+between accessions that a dense kernel exploits automatically: it explains most of the predictable signal, an explicit
+ancestry component adds nothing to it, and structure-based group screening (with an LD proxy) did not help either. The
+practical reading is that for a polygenic trait the structure is best used by modeling all SNPs jointly rather than by
+selecting a few.
+
+**Calibration.** Screening on the response and then quoting model-based intervals double-counts the data; calibrated
+intervals need either a calibration set untouched by screening (split conformal) or an analysis that accounts for the
+selection. Coverage is the one place where the dense model's advantage is not about accuracy but about trust.
+
+**Limitations.** One organism and two strongly correlated flowering traits; n of about 1,000 (a regime where an n x n
+dense kernel is cheap, which favors GBLUP; at much larger n and p screening and projection regain their computational
+role); ten splits of the same accessions; LD blocks proxied by clustering and positions rather than a gene annotation;
+the group-screening code implements only the GSIS statistic; approximate gene coordinates for FRI and FLC in the
+Manhattan plot are typed from memory and must be checked before citing.
+
+**Next steps.** (i) A trait dominated by a few large-effect loci (Section 11) to locate the regime where screening
+beats dense kernels; (ii) a consistency analysis for structure-aware projection (the open piece of the TARP theory),
+motivated by the equivalence of aggregated random projection and PCA seen here; (iii) LD-aware grouping from a gene
+annotation; (iv) larger samples, where screening is computationally necessary.
+
+# 14. Reproducibility
+
+| Block | Approximate time on the original laptop (3 cores) |
+|---|---|
+| Genome-wide Gram matrix (one-time) | 20 min |
+| TARP replication, per 10 splits (`si`) | 40 min |
+| Tuning comparisons (`e1`, `e1b`) | 30 min |
+| Targeted GBLUP (`e3`) | 10 min |
+| Group screening (`group`) | 40 min |
+| SIS / ISIS + penalized regression (`sis`) | 20 min |
+| Selection diagnostics, LD, simulation | 25 min |
+| Intervals (`e2`) | 5 min |
+| Structure, LCA, relatedness, within-lineage | 5 min |
+| Second trait (`trait_FT16`) | 40 min |
+
+```{r repro}
+cat("Cached result files:\n"); print(sort(list.files("cache")))
+cat("\nNote: the random-projection steps use the global random-number stream after each split seed, so recomputed results match\nthe original runs only up to Monte Carlo variation where code order was changed during the merge.\n\n")
+sessionInfo()
+```
